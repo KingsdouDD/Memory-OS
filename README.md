@@ -131,7 +131,7 @@ memory-os/                 # ⬇ 本地运行时数据
 
 ### 2. 配置环境变量
 
-创建 `memory-os-plugin/.env`（不上 GitHub）：
+创建 `memory-os-plugin/.env`：
 
 ```bash
 # Neo4j
