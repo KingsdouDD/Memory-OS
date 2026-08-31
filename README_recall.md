@@ -1,17 +1,10 @@
 # Memory OS 主动召回说明
 
-> 整理时间：2026-08-21
-> 整理人：小橘子
-
----
-
 ## 触发链路
 
 `before_prompt_build` 事件钩子（index.js 第 315 行附近）
 → 提取用户文本 → `recall_for_hook()` → `process_dream.py recall --hook`
 → 三路并行召回 → RRF 融合 → 去噪精排 → 注入 prompt
-
-> ⚠️ 2026-08-20 起该钩子临时禁用，改为被动召回（`memory_os_recall` 工具显式调用）。
 
 ---
 
