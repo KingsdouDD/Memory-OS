@@ -229,10 +229,10 @@ python3 scripts/service_lifecycle.py status
 
 ```json
 // 第一阶段
-{ "query": "去香港的事", "memory": {...} }
+{ "query": "去北京的事", "memory": {...} }
 
 // 第二阶段（拿 token）
-{ "query": "去香港的事", "memory": {...}, "confirm": true, "token": "xxx" }
+{ "query": "去北京的事", "memory": {...}, "confirm": true, "token": "xxx" }
 ```
 
 **快捷模式（直接指定 PID）：**
@@ -255,10 +255,10 @@ python3 scripts/service_lifecycle.py status
 
 ```json
 // 第一阶段
-{ "query": "去香港的事", "top_k": 5 }
+{ "query": "去北京的事", "top_k": 5 }
 
 // 第二阶段
-{ "query": "去香港的事", "confirm": true, "token": "xxx", "selected_pids": ["pid1", "pid2"] }
+{ "query": "去北京的事", "confirm": true, "token": "xxx", "selected_pids": ["pid1", "pid2"] }
 ```
 
 **快捷模式（直接指定 PID）：**
