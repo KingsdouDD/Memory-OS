@@ -87,7 +87,7 @@ def _now_cn() -> str:
 
 
 def log_hook_event(event_type, **fields):
-    """统一日志写入 hook-trace.md，老豆直接在电脑上 cat/less 看。
+    """统一日志写入 hook-trace.md，直接在电脑上 cat/less 看。
     每条事件渲染成一段可读 markdown：
       ### HH:MM:SS event_type
       - key: value
@@ -96,7 +96,7 @@ def log_hook_event(event_type, **fields):
     try:
         ts_full = datetime.now(CN_TZ)
         ts_str = ts_full.isoformat(timespec="seconds")
-        # 短时间戳（H2 标题用，老豆一眼能扫到节奏）
+        # 短时间戳（H2 标题用，一眼能扫到节奏）
         ts_short = ts_full.strftime("%H:%M:%S")
 
         lines = [f"### {ts_short} {event_type}", ""]
@@ -132,8 +132,8 @@ _config_dump_done = False
 
 
 def log_config_dump_once():
-    """老豆 2026-08-09 删：config_dump 是噪音，记到日志里 30+ 个正则/常量，没必要。
-    如果老豆要看生效参数，运行时跑：
+    """开发者 2026-08-09 删：config_dump 是噪音，记到日志里 30+ 个正则/常量，没必要。
+    如果要查看生效参数，运行时跑：
       python3 process_dream.py --help   (没有)
       或直接看 recall_config.py 的默认值
     """
@@ -143,13 +143,13 @@ def log_config_dump_once():
 # LLM 调用（OpenAI-compatible /chat/completions）
 # ============================================================
 # ============================================================
-# summary 质量校验（老豆 2026-08-10 加）
-# 防"印象式"垃圾记忆入库："外婆做事很认真"、"老豆的童年充满了快乐"
+# summary 质量校验（开发者 2026-08-10 加）
+# 防"印象式"垃圾记忆入库："外婆做事认真"、"用户童年充满快乐"
 # 这类抽象/泛泛句召回时相关性差，写入时就该拦下。
 # 判定：
 #   - 太抽象：只含状态形容词（认真/快乐/正能量），无具体动作/事件
 #   - 泛泛总结："充满了...""主要是..." 这类
-#   - 无实体：一个实体名都没有（外婆/老豆/小橘子…）
+#   - 无实体：一个实体名都没有（外婆/用户/助手…）
 # ============================================================
 
 _VAGUE_PATTERNS = [
@@ -187,7 +187,7 @@ def _has_concrete_action(summary):
     """判断 summary 是否有具体动作：动词 + 具体宾语。
     规则：jieba 分词后，存在一个动词 v，且 summary 里还有一个
     【名词/人名/专名】出现在 v 之后（作为宾语），且这个名词不是抽象状态词。
-    "疼老豆" → 动词"疼" + 名词"老豆" ✅ 具体
+    "疼用户" → 动词"疼" + 名词"用户" ✅ 具体
     "做事有强迫症" → 动词"做事"(泛动词) + "强迫症"(抽象) ❌ 印象式
     """
     import jieba.posseg as pseg
@@ -206,7 +206,7 @@ def _has_concrete_action(summary):
             return True
         if word in _COPULA_VERBS:
             # 系动词（是/有/在）：一律不算具体动作。
-            # "有轻微强迫症"、"是疼老豆的家人"——靠其他动词（疼/做/买）判断，
+            # "有轻微强迫症"、"是疼用户的家人"——靠其他动词（疼/做/买）判断，
             # 系动词本身太弱，容易被"性格非常正能量"里的"能量"误判为宾语。
             continue
         # 普通动词：后面跟 名词(n)/处所(s)/代词(r) 都算具体宾语；
@@ -292,7 +292,7 @@ def parse_ko_json(raw):
         if is_discardable(summary):
             continue
         # 🔧 2026-08-10 加：抽象/印象式 summary 直接丢弃
-        # （"外婆做事很认真"这类无具体事件的记忆，召回时是噪音）
+        # （"外婆做事认真"这类无具体事件的记忆，召回时是噪音）
         if _is_vague_summary(summary):
             print(f"[info] dropped vague summary: {summary[:60]}", file=sys.stderr)
             continue
@@ -414,9 +414,9 @@ def _tokenize_for_kg(text):
 
 
 # ============================================================
-# 词级意图加权（老豆 2026-08-10 加）
+# 词级意图加权（开发者 2026-08-10 加）
 # 纯向量召回抓不住"喝/看/吃"这种动词意图：
-#   query="老豆喜欢喝什么" → 向量全被"老豆"占权重，童年回忆全涌进来
+#   query="用户喜欢喝什么" → 向量全被"用户"占权重，童年回忆全涌进来
 #   query="外婆的饮食习惯" → "瑜伽"混进（句式太像）
 # 解法：jieba 分词，分【意图词（动词）】和【实体词（名词）】，
 # 排序时命中意图词的记忆显著加分，命中实体词的轻微加分。
@@ -452,7 +452,7 @@ def _extract_query_keywords(query):
     """从 query 提取 (意图词列表, 实体词列表)。
     意图词 = 动词（喝、看、吃、爬、玩…）+ 属性名词（习惯、爱好、性格…）
              —— 最能表达"想找什么"，summary 必须命中才算相关
-    实体词 = 人名 / 地名 / 专名（外婆、老豆、Memory OS…）
+    实体词 = 人名 / 地名 / 专名（外婆、用户、Memory OS…）
     """
     import jieba.posseg as pseg
     intent, entity = [], []
@@ -491,7 +491,7 @@ def _kw_hit_count(summary, words, prefix=False):
     """summary 命中了几个词。
     🔧 2026-08-10 修复：支持前缀匹配（动词词形变化）：
       "看过" 应命中 summary 里的"看"。动词取【首字】前缀即可（"看"）。
-      实体词（外婆/老豆/爬山）必须全词匹配，避免"外"误伤"外婆"。
+      实体词（外婆/用户/爬山）必须全词匹配，避免"外"误伤"外婆"。
     prefix=True → 只要 summary 含词的首字符就算命中（仅意图词用）
     prefix=False → 全词匹配（实体词用）
     """
@@ -678,7 +678,7 @@ def rrf_fuse(channels, k=60):
 # ============================================================
 # KG 验证（第三层）：实体重叠过滤（不做 LLM 调用）
 # ============================================================
-# 老豆 2026-08-10：kg_verify 已废弃，召回主流程用 recall_fusion.kg_verify_v2。
+# 开发者 2026-08-10：kg_verify 已废弃，召回主流程用 recall_fusion.kg_verify_v2。
 # 本地 kg_verify 是死代码。删除避免后人改错地方。
 # 主 recall 入口
 # ============================================================
@@ -761,7 +761,7 @@ def recall(query, top_k=None, rrf_k=None):
         except Exception as e:
             print(f"[warn] bm25 channel failed: {e}", file=sys.stderr)
 
-    # ===== BM25 关键词过滤：降为软过滤，不阻断高 BM25 分结果（老豆 2026-08-21）=====
+    # ===== BM25 关键词过滤：降为软过滤，不阻断高 BM25 分结果（开发者 2026-08-21）=====
     # BM25 本身负责词项相关性排序，额外字面硬过滤会误杀同义表达。
     # 例如 query="爬山"，summary="去黄山登山"，无"爬"字但语义完全相关，不应丢弃。
     # 改为：
@@ -940,7 +940,7 @@ def recall(query, top_k=None, rrf_k=None):
             graph_results.append(item)
 
     # ============================================================
-    # 召回输出端（老豆 2026-08-10 铁律：NEVER 凑数）
+    # 召回输出端（开发者铁律：NEVER 凑数）
     # ============================================================
     # 凑数禁令（铁律）：
     #   - 库里召回多少条就返回多少条
@@ -1086,7 +1086,7 @@ def recall_for_hook(query, top_k=None, rrf_k=None):
     result = recall(query, top_k=top_k, rrf_k=rrf_k)
     result["skipped"] = False
     result["reason"] = ""
-    # ----- 老豆 2026-08-09 删：JS 端 before_prompt_build 已经会写 injection_committed，
+    # ----- 开发者 2026-08-09 删：JS 端 before_prompt_build 已经会写 injection_committed，
     # ----- 这里再写 recall_injected 是同一份数据的双写（query/memories/channels 全重叠）。
     # ----- 召回成功路径只在 JS 端落盘；本函数返回 dict 让 JS 用。
     return result
@@ -1396,11 +1396,11 @@ def _sanitize_predicate(raw, allowed, denied_words):
 # ============================================================
 # 写入决策 v5（Mem0 风格：KG + ANN + LLM 三态决策）
 # ============================================================
-# 老豆 2026-08-10：方案 5
+# 开发者 2026-08-10：方案 5
 # 三态：CREATE / UPDATE / OVERRIDE / SKIP
 # 失败兜底：LLM 调用失败 → 默认 CREATE（不阻塞写入）
 # 决策落盘：memory-os/logs/write-decision.md
-# 所有可调参数都从 RecallConfig 读，方便老豆改
+# 所有可调参数都从 RecallConfig 读，方便改
 # ============================================================
 
 def _neo4j_session():

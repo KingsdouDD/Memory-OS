@@ -70,7 +70,7 @@ L2_COLLECTION = "memory_scenario"
 L3_COLLECTION = "memory_persona"
 L0_COLLECTION = "memory_l0"
 
-# ── 向量模型分水岭（老豆确认：0.62 是确值，以下都是噪声）─────────────
+# ── 向量模型分水岭（确认：0.62 是确值，以下都是噪声）─────────────
 SIM_WATERMARK = 0.62
 
 # ── L2/L3 召回质量门控 ───────────────────────────────────────────

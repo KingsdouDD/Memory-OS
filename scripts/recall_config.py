@@ -7,7 +7,7 @@ Recall 流水线的全部可调参数集中地（"参数中心"）
   - 所有可调参数都在这里，默认值等于 process_dream.py / recall_gate.py
     当前硬编码的值，确保不改 env 时行为零变化
   - 优先级：环境变量 > 类内默认值
-  - 老豆调参只改环境变量，不必动代码；也不必重启插件外的常驻进程
+  - 调参只改环境变量，不必动代码；也不必重启插件外的常驻进程
     （下次进程启动 / 重新 import 时生效）
 
 环境变量 → 参数映射（部分）：
@@ -86,8 +86,8 @@ def _env_bool(key: str, default: bool) -> bool:
 # ============================================================
 
 # Hook 门控
-_DEFAULT_HOOK_MIN_LEN = 5   # 老豆 2026-08-25：字数要求降到2字 → 5字
-_DEFAULT_HOOK_MAX_LEN = 300  # 老豆 2026-08-20：太长段落按句拆，不整段送召回
+_DEFAULT_HOOK_MIN_LEN = 5   # 开发者 2026-08-25：字数要求降到2字 → 5字
+_DEFAULT_HOOK_MAX_LEN = 300  # 开发者 2026-08-20：太长段落按句拆，不整段送召回
 _DEFAULT_HOOK_SKIP_FILLER = [
     "嗯", "啊", "哦", "嗯嗯", "啊啊", "哦哦", "噢", "喔", "嗳",
     "好", "好的", "好哒", "行", "可以", "ok", "OK", "Ok", "okay", "OKAY",
@@ -110,8 +110,8 @@ _DEFAULT_SWEAR_PATTERNS = [
 ]
 
 # 向量召回
-_DEFAULT_VEC_TOP_K = 3   # 老豆 2026-08-20：BM25 主召，Vec 辅助；改为 top3
-_DEFAULT_VEC_TOP_K_MULTIPLIER = 1  # 老豆 2026-08-09 改：2 → 1（vec 召回直接要 top-20，不再乘 2）
+_DEFAULT_VEC_TOP_K = 3   # 开发者 2026-08-20：BM25 主召，Vec 辅助；改为 top3
+_DEFAULT_VEC_TOP_K_MULTIPLIER = 1  # 开发者 2026-08-09 改：2 → 1（vec 召回直接要 top-20，不再乘 2）
 _DEFAULT_BM25_TOP_K = 5   # BM25 通道候选数（后续会与 RecallConfig.BM25_TOP_K 取 max，确保拉够候选）
 _DEFAULT_COLLECTIONS = [
     "memory_atom", "memory_fact", "memory_event", "memory_experience",
@@ -120,14 +120,14 @@ _DEFAULT_COLLECTIONS = [
 ]
 
 # 图召回
-_DEFAULT_GRAPH_DEPTH = 1          # 老豆 2026-08-08 改回 1 跳：避免 2 跳把"Memory OS"整张子图捞回来
+_DEFAULT_GRAPH_DEPTH = 1          # 开发者 2026-08-08 改回 1 跳：避免 2 跳把"Memory OS"整张子图捞回来
 _DEFAULT_GRAPH_LIMIT_PER_NODE = 4  # 每节点扩展上限
 
-# 向量召回质量门槛（老豆 2026-08-08 加）
+# 向量召回质量门槛（开发者 2026-08-08 加）
 # 业界共识：cosine < 0.55 都是垃圾，参考
 #   https://dev.to/yaruyng/retrieval-strategy-design-vector-keyword-and-hybrid-search-53j3
 #   "> 0.85 强相关 / 0.75-0.85 可接受 / < 0.70 噪音"
-_DEFAULT_VEC_MIN_SCORE = 0.60     # 老豆 2026-08-25 16:43：0.70 → 0.60（提高召回召回数）
+_DEFAULT_VEC_MIN_SCORE = 0.60     # 开发者 2026-08-25 16:43：0.70 → 0.60（提高召回召回数）
 
 # RRF 融合
 _DEFAULT_RRF_K = 60
@@ -138,33 +138,33 @@ _DEFAULT_KG_STRONG_THRESHOLD = 0.7
 _DEFAULT_KG_WEAK_THRESHOLD = 0.60
 _DEFAULT_KG_TOP_N = 5
 # ── 2026-08-21 新增 ──
-# BM25 关键词过滤（老豆 2026-08-21：降为软过滤，不阻断）
+# BM25 关键词过滤（开发者 2026-08-21：降为软过滤，不阻断）
 _DEFAULT_BM25_KEYWORD_FILTER_RATIO = 0.0   # 0=关闭；>0=BM25结果中要求至少N%含关键词才保留
 _DEFAULT_BM25_KEYWORD_FILTER_MIN = 0       # 至少保留 N 条，不足则全部保留
-# PRF 触发：字面重叠阈值（老豆 2026-08-21：改为实体/关系触发，不再只看字面）
+# PRF 触发：字面重叠阈值（开发者 2026-08-21：改为实体/关系触发，不再只看字面）
 _DEFAULT_PRF_TOKEN_OVERLAP_MIN = 0  # 0=关闭字面触发，改用实体/关系触发
 # kg_verify 综合排序：sim 对最终排序的权重（0=纯 sort_key，1=纯 sim）
 _DEFAULT_KG_SIM_RANKING_WEIGHT = 0.61
-# 意图过滤模式（老豆 2026-08-21：动词意图软化，不再硬过滤）
+# 意图过滤模式（开发者 2026-08-21：动词意图软化，不再硬过滤）
 _DEFAULT_INTENT_VERB_HARD_FILTER = False
 _DEFAULT_INTENT_VERB_SOFT_WEIGHT = 0.05
 # 调试日志级别
 _DEFAULT_RECALL_DEBUG = os.environ.get("MEMORY_OS_RECALL_DEBUG", "0")
 
 # Recall 入口
-# 老豆 2026-08-10 改：5 → 8 → 12（业界黄金区 8-15；vec 主力召够多，覆盖跨话题对话）
-_DEFAULT_RECALL_TOP_K = 8  # 老豆 2026-08-20：融合后保留8条进kg_verify，不凑数
+# 开发者 2026-08-10 改：5 → 8 → 12（业界黄金区 8-15；vec 主力召够多，覆盖跨话题对话）
+_DEFAULT_RECALL_TOP_K = 8  # 开发者 2026-08-20：融合后保留8条进kg_verify，不凑数
 _DEFAULT_RECALL_RRF_K = 60
 
 # 写入去重
 _DEFAULT_DEDUP_THRESHOLD = 0.82
 
-# 写入决策 v5（老豆 2026-08-10：Mem0 方案 5）
+# 写入决策 v5（开发者 2026-08-10：Mem0 方案 5）
 _DEFAULT_WRITE_ANN_RECALL_THRESHOLD = 0.80   # ANN 召回门槛（召回宽，让 LLM 决策严）
 _DEFAULT_WRITE_DECISION_TOP_K = 3            # 召回候选数（top-K 给 LLM 看）
 _DEFAULT_WRITE_DECISION_TEMPERATURE = 0.1    # LLM 决策温度（0.1 = 准确定性 + 防 thinking 循环）
 _DEFAULT_WRITE_DECISION_MAX_TOKENS = 500     # LLM 决策输出上限
-_DEFAULT_WRITE_DECISION_MODEL = "MiniMax-M3" # 决策专用模型（老豆 2026-08-10 拍：M3 输出更稳）
+_DEFAULT_WRITE_DECISION_MODEL = "MiniMax-M3  # 决策专用模型（开发者 2026-08-10 拍：M3 输出更稳）
 _DEFAULT_WRITE_DECISION_LOG_PATH = str(Path.home()) + "/.openclaw/workspace/memory-os/logs/write-decision.md"
 
 # 会话级 query 去重缓存
@@ -172,7 +172,7 @@ _DEFAULT_SESSION_CACHE_ENABLED = True
 _DEFAULT_SESSION_CACHE_TTL = 0  # 0 = 仅本次进程内有效
 
 # ============================================================
-# 写入 schema 白名单（老豆 2026-08-10 拍）
+# 写入 schema 白名单（开发者 2026-08-10 拍）
 # 原则：
 #   - 关系：49 个，按场景分组（人物基础 / 生活行为 / 情感表达 / 学习工作 / 拥有状态 / 时间锚点）
 #   - label：11 个，按生活场景裁剪（砍业务扩展 Product/Feature/Disease/...）
@@ -287,7 +287,7 @@ class RecallConfig:
         "MEMORY_OS_DEDUP_THRESHOLD", _DEFAULT_DEDUP_THRESHOLD
     )
 
-    # ---- 写入决策 v5（老豆 2026-08-10：Mem0 方案 5）----
+    # ---- 写入决策 v5（开发者 2026-08-10：Mem0 方案 5）----
     WRITE_ANN_RECALL_THRESHOLD = _env_float(
         "MEMORY_OS_WRITE_ANN_RECALL_THRESHOLD",
         _DEFAULT_WRITE_ANN_RECALL_THRESHOLD,
@@ -365,7 +365,7 @@ class RecallConfig:
             )
         return json.dumps(out, ensure_ascii=False, indent=2)
 
-    # ---- 写入 schema 白名单（老豆 2026-08-10 拍）----
+    # ---- 写入 schema 白名单（开发者 2026-08-10 拍）----
     ALLOWED_RELATIONSHIPS = frozenset(_env_list(
         "MEMORY_OS_ALLOWED_RELATIONSHIPS",
         _DEFAULT_ALLOWED_RELATIONSHIPS,

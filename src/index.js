@@ -2,7 +2,7 @@
 // Hooks into OpenClaw lifecycle to inject relevant memories into prompts
 // and write dream reports into Neo4j + Qdrant at the scheduled time.
 //
-// 监控日志：~/.openclaw/workspace/memory-os/logs/hook-trace.md (markdown append，老豆直接在电脑上 cat/less 看)
+// 监控日志：~/.openclaw/workspace/memory-os/logs/hook-trace.md (markdown append，直接在电脑上 cat/less 看)
 //   - recall_skipped       (门控跳过)
 //   - injection_committed  (记忆块真的拼好即将 prepend 到 system)
 //   - recall_failed        (Python 召回失败)
@@ -134,7 +134,7 @@ async function ensureServicesRunning() {
 }
 
 // 同会话 query 去重缓存：Map<sessionKey, Set<queryHash>>
-// 老豆说过："不需要做那么复杂的记忆召回对比，你就做，触发的用户问题就可以了"
+// "用户"说过："不需要做那么复杂的记忆召回对比，你就做，触发的用户问题就可以了"
 // 所以只对用户问题的 md5 做去重，不对比 memory 内容
 const sessionRecallCache = new Map();
 
@@ -183,7 +183,7 @@ function logEvent(event_type, fields = {}) {
     const _expandedLogPath = LOG_PATH.replace(/\$\{HOME\}/g, process.env.HOME || "");
     fs.mkdirSync(path.dirname(_expandedLogPath), { recursive: true });
     const ts = new Date();
-    // 老豆 2026-08-11 反馈：用本地时间（HH:MM:SS）而不是 UTC，
+    // 开发者 2026-08-11 反馈：用本地时间（HH:MM:SS）而不是 UTC，
     // 否则日志里的时间和人眼看到的时间差 8 小时，排查问题很懵。
     const pad = (n) => String(n).padStart(2, "0");
     const tsShort = `${pad(ts.getHours())}:${pad(ts.getMinutes())}:${pad(ts.getSeconds())}`;
@@ -213,7 +213,7 @@ function logEvent(event_type, fields = {}) {
     }
     fs.appendFileSync(LOG_PATH, lines.join("\n") + "\n\n", "utf-8");
     // 按字节滚动：超限就从头砍掉，保留后半段（md 按事件块分割，不会破坏内容）
-    // LOG_KEEP_BYTES=0 表示不滚动（老豆想看完整历史就设 0）
+    // LOG_KEEP_BYTES=0 表示不滚动（想看完整历史就设 0）
     try {
       if (LOG_KEEP_BYTES <= 0) return;
       const stat = fs.statSync(LOG_PATH);
@@ -363,7 +363,7 @@ export default definePluginEntry({
         }
       }
       if (!userText) {
-        // 调试：content 取不到时写日志（正式写 hook-trace，老豆不用翻 tmp 文件）
+        // 调试：content 取不到时写日志（正式写 hook-trace，不用翻 tmp 文件）
         logEvent("userText_empty", {
           session: sessionKey,
           content_type: typeof rawContent,

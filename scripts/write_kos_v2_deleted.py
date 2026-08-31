@@ -40,7 +40,7 @@ def write_kos(kos):
             vecs = embed(text)
             if not vecs:
                 # 【修复 D】embedding 服务不可用 → 记 error + warn，不再静默跳过
-                # 此时 Neo4j 已写、Qdrant 未写，两边不一致；必须让老豆在报告里看到
+                # 此时 Neo4j 已写、Qdrant 未写，两边不一致；必须在报告里看到
                 report["qdrant"]["errors"] += 1
                 print(f"[warn] embed failed, Qdrant skipped (Neo4j already written) ko.summary={ko.get('summary', '')[:60]}", file=sys.stderr)
                 continue

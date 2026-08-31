@@ -505,8 +505,8 @@ def fusion_graphrag_hooks(graph_channel_items):
 if __name__ == "__main__":
     # 模拟一些数据
     graph_items = [
-        {"summary": "老豆 KNOWS 小橘子", "source": "graph", "score": 1.0, "depth": 1},
-        {"summary": "外婆 PARENT_OF 老豆", "source": "graph", "score": 1.0, "depth": 2},
+        {"summary": "用户 KNOWS 助手", "source": "graph", "score": 1.0, "depth": 1},
+        {"summary": "外婆 PARENT_OF 用户", "source": "graph", "score": 1.0, "depth": 2},
     ]
     vec_items = [
         {"summary": "向量召回的记忆 A", "source": "vec", "score": 0.9},

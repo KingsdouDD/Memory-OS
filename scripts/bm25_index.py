@@ -293,8 +293,8 @@ if __name__ == "__main__":
     idx = get_index(lazy=False)
     if idx:
         print(f"  docs: {len(idx.documents)}")
-        print("  sample search: 老豆")
-        results = bm25_search("老豆", top_k=5)
+        print("  sample search: 用户")
+        results = bm25_search("用户", top_k=5)
         for r in results:
             print(f"    [{r['norm_score']:.3f}] {r['summary'][:60]}")
     else:
