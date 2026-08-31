@@ -89,7 +89,7 @@ memory-os-plugin/          # ⬆ 上传到 GitHub 的插件代码
 ├── package.json
 └── README.md
 
-memory-os/                 # ⬇ 本地运行时数据（不上 GitHub）
+memory-os/                 # ⬇ 本地运行时数据
 ├── venv/                  # Python 虚拟环境
 ├── models/                # Embedding 模型（GGUF）
 ├── neo4j/                 # Neo4j 数据目录
@@ -97,9 +97,6 @@ memory-os/                 # ⬇ 本地运行时数据（不上 GitHub）
 └── logs/                  # 运行日志
 ```
 
-**上传 GitHub 的只有 `memory-os-plugin/` 目录。** `memory-os/` 目录（数据库、模型、日志）含用户私人记忆，绝不推送。
-
----
 
 ## 环境依赖
 
