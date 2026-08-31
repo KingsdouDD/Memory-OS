@@ -91,7 +91,7 @@ memory-os-plugin/          # ⬆ 上传到 GitHub 的插件代码
 
 memory-os/                 # ⬇ 本地运行时数据
 ├── venv/                  # Python 虚拟环境
-├── models/                # Embedding 模型（GGUF）
+├── models/                # Embedding 模型（GGUF/MLX）
 ├── neo4j/                 # Neo4j 数据目录
 ├── qdrant/                # Qdrant 数据目录
 └── logs/                  # 运行日志
@@ -113,7 +113,7 @@ memory-os/                 # ⬇ 本地运行时数据
 
 ### Embedding 模型
 
-默认使用本地 BGE-M3（GGUF 格式，Metal 加速）：
+默认使用本地 BGE-M3（GGUF/MLX 格式，Metal 加速）：
 
 ```
 ~/.openclaw/workspace/memory-os/models/bge-m3-Q8_0.gguf
