@@ -9,7 +9,7 @@ def write_kos(kos):
         print(f"[warn] qdrant client init failed: {e}", file=sys.stderr)
 
     for ko in kos:
-        # 实体清洗：丢脏实体名（如"外婆记忆召回"被误抽成实体）
+        # 实体清洗：丢脏实体名（如"记忆召回"被误抽成实体）
         ko, dropped = clean_ko_for_write(ko)
         if dropped:
             continue

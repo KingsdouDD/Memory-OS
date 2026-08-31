@@ -144,12 +144,12 @@ def log_config_dump_once():
 # ============================================================
 # ============================================================
 # summary 质量校验（开发者 2026-08-10 加）
-# 防"印象式"垃圾记忆入库："外婆做事认真"、"用户童年充满快乐"
+# 防"印象式"垃圾记忆入库："用户做事认真"、"用户童年充满快乐"
 # 这类抽象/泛泛句召回时相关性差，写入时就该拦下。
 # 判定：
 #   - 太抽象：只含状态形容词（认真/快乐/正能量），无具体动作/事件
 #   - 泛泛总结："充满了...""主要是..." 这类
-#   - 无实体：一个实体名都没有（外婆/用户/助手…）
+#   - 无实体：一个实体名都没有（某人/用户/助手…）
 # ============================================================
 
 _VAGUE_PATTERNS = [
@@ -233,7 +233,7 @@ def _is_vague_summary(summary):
     for p in _VAGUE_PATTERNS:
         if re.search(p, s):
             return True
-    # 无具体动作 → 印象式（"外婆做事认真"这种）
+    # 无具体动作 → 印象式（"用户做事认真"这种）
     if not _has_concrete_action(s):
         return True
     return False
@@ -292,7 +292,7 @@ def parse_ko_json(raw):
         if is_discardable(summary):
             continue
         # 🔧 2026-08-10 加：抽象/印象式 summary 直接丢弃
-        # （"外婆做事认真"这类无具体事件的记忆，召回时是噪音）
+        # （"用户做事认真"这类无具体事件的记忆，召回时是噪音）
         if _is_vague_summary(summary):
             print(f"[info] dropped vague summary: {summary[:60]}", file=sys.stderr)
             continue
@@ -417,7 +417,7 @@ def _tokenize_for_kg(text):
 # 词级意图加权（开发者 2026-08-10 加）
 # 纯向量召回抓不住"喝/看/吃"这种动词意图：
 #   query="用户喜欢喝什么" → 向量全被"用户"占权重，童年回忆全涌进来
-#   query="外婆的饮食习惯" → "瑜伽"混进（句式太像）
+#   query="用户的饮食习惯" → "瑜伽"混进（句式太像）
 # 解法：jieba 分词，分【意图词（动词）】和【实体词（名词）】，
 # 排序时命中意图词的记忆显著加分，命中实体词的轻微加分。
 # ============================================================
@@ -452,7 +452,7 @@ def _extract_query_keywords(query):
     """从 query 提取 (意图词列表, 实体词列表)。
     意图词 = 动词（喝、看、吃、爬、玩…）+ 属性名词（习惯、爱好、性格…）
              —— 最能表达"想找什么"，summary 必须命中才算相关
-    实体词 = 人名 / 地名 / 专名（外婆、用户、Memory OS…）
+    实体词 = 人名 / 地名 / 专名（某人、用户、Memory OS…）
     """
     import jieba.posseg as pseg
     intent, entity = [], []
@@ -491,7 +491,7 @@ def _kw_hit_count(summary, words, prefix=False):
     """summary 命中了几个词。
     🔧 2026-08-10 修复：支持前缀匹配（动词词形变化）：
       "看过" 应命中 summary 里的"看"。动词取【首字】前缀即可（"看"）。
-      实体词（外婆/用户/爬山）必须全词匹配，避免"外"误伤"外婆"。
+      实体词（用户/爬山）必须全词匹配，避免"外"误伤。
     prefix=True → 只要 summary 含词的首字符就算命中（仅意图词用）
     prefix=False → 全词匹配（实体词用）
     """
@@ -814,7 +814,7 @@ def recall(query, top_k=None, rrf_k=None):
     # RRF 融合中，ko_summary 当 query 扩展项，反哺 qdrant 召一轮。
     # 修复 2026-08-09 19:38：扩展不能只用 ko_summary（会被实体名带偏召不相关 KO），
     # 要拼回原始 query 保持主题不偏。
-    # 🔧 2026-08-10 修复 #2：原阈值 len(s) > 6 太严格，把 "外婆爬山" 这种 ko_summary 一刀切掉。
+    # 🔧 2026-08-10 修复 #2：原阈值 len(s) > 6 太严格，把 "用户爬山" 这种 ko_summary 一刀切掉。
     #     放宽到 len(s) >= 2（实体名至少 2 字），并记录原始全 ID 便于按 point id 去重。
     # ── 2026-08-21：PRF 触发逻辑重构 ──
     # 优先级：
@@ -983,7 +983,7 @@ def recall(query, top_k=None, rrf_k=None):
         parts = summary.split()
         if len(parts) <= 3:
             continue  # 太短，肯定是拼的
-        # 如果是以 [大写谓词] 隔开的（如 "外婆 RELATES_TO 君君"）也跳过
+        # 如果是以 [大写谓词] 隔开的（如 "用户 RELATES_TO 某人"）也跳过
         if any(p.isupper() and len(p) > 3 for p in parts):
             continue
         et = item.get("event_time") or {}
