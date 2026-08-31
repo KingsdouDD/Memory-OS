@@ -1,0 +1,29 @@
+{
+  "id": "memory-os",
+  "name": "Memory OS",
+  "version": "1.0.0",
+  "description": "Neo4j + Qdrant long-term memory system",
+  "contracts": {
+    "hooks": ["user_request", "message_received", "agent_end", "before_prompt_build"],
+    "tools": ["memory_os_ingest", "memory_os_recall", "memory_os_update", "memory_os_delete"]
+  },
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "neo4jUri": { "type": "string", "default": "bolt://127.0.0.1:7687" },
+      "neo4jUser": { "type": "string", "default": "neo4j" },
+      "neo4jPassword": { "type": "string" },
+      "qdrantHost": { "type": "string", "default": "127.0.0.1" },
+      "qdrantPort": { "type": "integer", "default": 6333 },
+      "embeddingModel": { "type": "string", "default": "${HOME}/.openclaw/workspace/models/bge-m3-Q8_0.gguf" },
+      "cronSchedule": { "type": "string", "default": "30 3 * * *" },
+      "dedupThreshold": { "type": "number", "default": 0.95 },
+      "hookTraceEnabled": { "type": "boolean", "default": true,
+        "description": "开关钩子日志（hook-trace.md），默认开；设为 false 关闭写入，排查问题时再开" }
+    },
+    "required": ["neo4jPassword"]
+  }
+}

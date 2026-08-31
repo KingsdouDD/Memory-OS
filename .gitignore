@@ -1,0 +1,30 @@
+# 日志和数据（隐私）
+logs/
+memory-os/
+memory/
+
+# 备份文件
+*.bak-*
+*.bak
+*.bак
+
+# 系统文件
+.DS_Store
+._*
+Thumbs.db
+
+# Node 运行产物
+node_modules/
+*.log
+
+# Python 运行产物
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+
+# 本地配置文件（如果有人配了本地路径）
+*.local.json
+*.local.yaml
+.env
