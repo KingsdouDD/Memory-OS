@@ -687,32 +687,12 @@ def recall_4layer(query, top_k=5, layers=None):
 
             atom = items[:top_k * 2]
 
-    # ── Step 5: Reranker 精排（Qwen3-Reranker-0.6B，P(yes) ≥ 0.62 才保留）───
-    if atom:
-        summaries = [m.get("summary", "") for m in atom]
-
-        # 调 reranker HTTP 服务（官方 yes/no 打分）
-        reranked = _rerank_via_http(query, summaries, top_k=len(summaries))
-        rerank_map = {idx: score for idx, score in reranked}
-
-        # 把 reranker 分数注入 atom
-        for i, m in enumerate(atom):
-            m["rerank_score"] = rerank_map.get(i, 0.0)
-
-        # P(yes) < 0.62 的结果丢弃（噪声过滤，0.62 = embedding sim 水位等效）
-        before = len(atom)
-        atom = [m for m in atom if m.get("rerank_score", 0) >= SIM_WATERMARK]
-        dropped = before - len(atom)
-
-        # 综合 rerank_score + entity_overlap 排序
-        if atom:
-            w = ENTITY_OVERLAP_WEIGHT
-            for m in atom:
-                overlap = m.get("entity_overlap", 0)
-                rr_score = m.get("rerank_score", 0)
-                m["final_score"] = round(rr_score * (1 - w) + overlap * w, 4)
-            atom.sort(key=lambda x: -x.get("final_score", 0))
-            atom = atom[:top_k]
+    # ── Step 5: Pre-filter by entity overlap（不做 Reranker，减少调用）──────────
+    # 用 entity_overlap + vector_score 做粗排，保留 top_k×3 进入候选池
+    if atom and filter_entities:
+        atom = _rerank_by_entity_overlap(atom, filter_entities)
+        atom.sort(key=lambda x: -x.get("combined_score", x.get("score", 0)))
+        atom = atom[:top_k * 3]   # Pre-filter：保留 3 倍候选量
 
     # ── Step 6: Association Expansion（联想记忆）────────────────────
     # 如果 L3/L2 有召回 entities → 用 filter_entities 启动联想
@@ -765,50 +745,19 @@ def recall_4layer(query, top_k=5, layers=None):
         assoc_triggered = len(assoc_candidates) > 0
 
         if assoc_triggered:
-            # 对联想候选做 reranker 精排（用 seed recall 的 reranker）
-            assoc_summaries = [c.get("summary", "") for c in assoc_candidates]
-            assoc_reranked = _rerank_via_http(query, assoc_summaries, top_k=len(assoc_summaries))
-            assoc_rerank_map = {idx: score for idx, score in assoc_reranked}
-
-            has_reranker = len(assoc_rerank_map) > 0
-            for i, c in enumerate(assoc_candidates):
-                rr = assoc_rerank_map.get(i)
-                if rr is not None:
-                    c["rerank_score"] = rr
-                    # 有 reranker 分数时：综合评分
-                    c["final_score"] = round(
-                        rr * 0.6 + c.get("assoc_score", 0) * 0.4,
-                        4,
-                    )
-                else:
-                    # reranker 失败（服务冷启动）时：用 assoc_score 作为 final_score
-                    c["rerank_score"] = 0.0
-                    c["final_score"] = c.get("assoc_score", 0)
-
-            # P(yes) < 0.55 的联想候选丢弃（reranker 失败时改为 assoc_score 阈值）
-            if has_reranker:
-                assoc_candidates = [
-                    c for c in assoc_candidates
-                    if (c.get("rerank_score", 0) >= 0.55 or c.get("assoc_score", 0) >= 0.65)
-                ]
-            else:
-                # reranker 不可用：只靠 assoc_score 筛选（> 0.60）
-                assoc_candidates = [
-                    c for c in assoc_candidates
-                    if c.get("assoc_score", 0) >= 0.60
-                ]
-            assoc_candidates.sort(key=lambda x: -x.get("final_score", 0))
-            assoc_candidates = assoc_candidates[:top_k]
-
-            # 标记这些是联想来的记忆
+            # 联想候选先不做 Reranker，等合并后统一做一次
+            # Pre-filter：按 assoc_score 粗排，保留 top_k×3
+            assoc_candidates.sort(key=lambda x: -x.get("assoc_score", 0))
+            assoc_candidates = assoc_candidates[:top_k * 3]
+            # 标记这些是联想来的记忆（先不做 final_score，等统一 Reranker）
             for c in assoc_candidates:
                 c["_is_assoc"] = True
 
-    # ── 合并 seed atom + association candidates ───────────────────
-    # 去重：用完整 summary 精确匹配（避免 60字前缀误判重复）
+    # ── 合并 seed atom + association candidates ────────────────────────
+    # 去重：用完整 summary 精确匹配
     seed_summaries_full = {m.get("summary", "") for m in atom}
 
-    # 统一格式：给 atom 的记忆也补 recall_reason
+    # 统一格式：给 atom 的记忆补 recall_reason
     for m in atom:
         if "recall_reason" not in m:
             m["recall_reason"] = "直接匹配"
@@ -816,13 +765,15 @@ def recall_4layer(query, top_k=5, layers=None):
     merged_atom = list(atom)
     for c in assoc_candidates:
         full_sum = c.get("summary", "")
-        # 完整 summary 精确匹配去重
         if full_sum and full_sum not in seed_summaries_full:
             merged_atom.append({
                 "summary": full_sum,
                 "relation": c.get("relation", "") or "",
                 "score": c.get("score", 0),
                 "rerank_score": c.get("rerank_score", 0),
+                "assoc_score": c.get("assoc_score", 0),
+                "hop_depth": c.get("hop_depth", 1),
+                "association_path": c.get("association_path", []),
                 "final_score": c.get("final_score", 0),
                 "source": c.get("source", "assoc"),
                 "_qdrant_pid": c.get("_qdrant_pid"),
@@ -833,13 +784,54 @@ def recall_4layer(query, top_k=5, layers=None):
                 "tags": c.get("tags") or [],
                 "entities": c.get("entities") or [],
                 "recall_reason": c.get("recall_reason", "通过联想激活"),
-                "association_path": c.get("association_path", []),
-                "_is_assoc": True,
+                "_is_assoc": c.get("_is_assoc", False),
             })
 
-    # 最终排序（按 final_score 降序）
+    # ── 统一 Reranker（一次调用，精排全部候选）──────────────────────
+    # retrieval_top_k: 合并后进入 Reranker 的候选数量
+    retrieval_top_k = len(merged_atom)
+    reranker_input_k = retrieval_top_k  # 输入数量（input k = output k）
+    reranker_output_k = retrieval_top_k
+
+    reranker_call_count = 0
+    if merged_atom:
+        summaries_for_rerank = [m.get("summary", "") for m in merged_atom]
+        reranked = _rerank_via_http(query, summaries_for_rerank, top_k=reranker_output_k)
+        reranker_call_count = 1
+        rerank_map = {idx: score for idx, score in reranked}
+
+        for i, m in enumerate(merged_atom):
+            rr = rerank_map.get(i, 0.0)
+            m["rerank_score"] = rr
+            # 综合打分：
+            #   seed 记忆（_is_assoc=False）：rerank × 0.6 + entity_overlap × 0.4
+            #   联想记忆（_is_assoc=True）：rerank × 0.6 + assoc_score × 0.4
+            if m.get("_is_assoc"):
+                m["final_score"] = round(
+                    rr * 0.6 + m.get("assoc_score", 0) * 0.4,
+                    4,
+                )
+            else:
+                m["final_score"] = round(
+                    rr * 0.6 + m.get("entity_overlap", 0) * 0.4,
+                    4,
+                )
+
+    # Pre-filter：rerank score 水位过滤（0.55，低于直接丢弃）
+    before_rerank = len(merged_atom)
+    merged_atom = [
+        m for m in merged_atom
+        if m.get("rerank_score", 0) >= 0.55
+    ]
+
+    # 最终排序 + output k
     merged_atom.sort(key=lambda x: -x.get("final_score", x.get("score", 0)))
     merged_atom = merged_atom[:top_k]
+
+    all_memories = [_format_memory_with_time(m) for m in merged_atom if m.get("summary")]
+    overlap_avg = (
+        sum(m.get("entity_overlap", 0) for m in merged_atom) / max(len(merged_atom), 1)
+    )
 
     all_memories = [_format_memory_with_time(m) for m in merged_atom if m.get("summary")]
     overlap_avg = (

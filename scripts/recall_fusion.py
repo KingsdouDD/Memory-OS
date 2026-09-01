@@ -599,44 +599,61 @@ def association_expand(query, seed_entities, seed_summaries, config, embed_fn=No
 
     seed_summaries_lower = {s.lower() for s in (seed_summaries or []) if s}
 
-    # ── Step 1: Hop 扩散，收集关联实体 ──────────────────────────
+    # ── Step 1: Hop 扩散，收集关联实体（带 hop_depth + path 追踪）───────────
+    # visited_entities: {lower_name: {"original": str, "hop": int, "path": [str]}}
+    #   path = [seed_entity, ..., intermediate_entity]
     from process_dream import neo4j_expand
-    visited_entities = dict()   # key: lowercase name, value: original name
+
+    visited = dict()  # key: lower name, value: {original, hop, path}
+
+    def _add_entity(name, hop, path):
+        key = name.lower().strip()
+        if key and len(key) >= 2 and key not in visited:
+            visited[key] = {"original": name.strip(), "hop": hop, "path": path}
+            return True
+        return False
+
+    # 初始化 seed entities（hop=1）
     for e in seed_entities:
         if e and len(e.strip()) >= 2:
-            visited_entities[e.strip().lower()] = e.strip()
+            _add_entity(e, 1, [e.strip()])
 
-    current_entities = [e for e in seed_entities if e and len(e.strip()) >= 2]
+    # 多跳扩散
+    current_keys = list({e.strip().lower() for e in seed_entities if e and len(e.strip()) >= 2})
 
     for hop in range(1, config.ASSOC_MAX_HOPS + 1):
-        if not current_entities:
+        if not current_keys:
             break
-        next_entities = []
-        for ent_name in current_entities[:config.ASSOC_MAX_NEIGHBORS]:
+        next_keys = []
+        for ent_key in current_keys[:config.ASSOC_MAX_NEIGHBORS]:
+            ent_name = visited[ent_key]["original"]  # 用 original 大小写形式查
             try:
                 neighbors = neo4j_expand([ent_name], depth=1,
                                          limit_per_node=config.ASSOC_MAX_NEIGHBORS)
             except Exception:
                 continue
-
             for n in neighbors:
                 for t in (n.get("raw_triples") or []):
                     for name in ((t.get("subj") or "").strip(),
                                   (t.get("obj") or "").strip()):
+                        if not name or len(name.strip()) < 2:
+                            continue
                         key = name.lower()
-                        if key and key not in visited_entities and len(name) >= 2:
-                            visited_entities[key] = name
-                            next_entities.append(name)
-        current_entities = next_entities
-        if not current_entities:
-            break
+                        # path = seed_entity → ... → current_entity → new_entity
+                        parent_path = visited.get(ent_key, {}).get("path", [ent_name])
+                        new_path = parent_path + [name.strip()]
+                        if _add_entity(name, hop + 1, new_path):
+                            next_keys.append(key)
+        current_keys = next_keys
+
+    if not visited:
+        return []
 
     # ── Step 2: 构造 expansion text + vector ─────────────────────
-    all_ent_names = list(visited_entities.values())
+    all_ent_names = [v["original"] for v in visited.values()]
     exp_parts = [query]
     if seed_summaries:
         exp_parts.extend(seed_summaries[:3])
-    # 加入扩散实体的名字（增强主题）
     exp_parts.extend(all_ent_names[:15])
     expansion_text = " ".join(exp_parts)
 
@@ -665,11 +682,9 @@ def association_expand(query, seed_entities, seed_summaries, config, embed_fn=No
     if not hits:
         return []
 
-    # hits 格式：[(coll, {"id": ..., "score": ..., "payload": ...}), ...]
-    # ── Step 4: 多维 Association Scoring ────────────────────────
+    # ── Step 4: 多维 Association Scoring（带真实 hop_depth）───────────
     assoc_candidates = []
     for coll, hit in hits:
-        # hit 本身是 dict，包含 id/score/payload
         hit_dict = hit if isinstance(hit, dict) else {}
         pl = hit_dict.get("payload") or {}
         summary = pl.get("summary") or ""
@@ -680,38 +695,59 @@ def association_expand(query, seed_entities, seed_summaries, config, embed_fn=No
         if summary.lower() in seed_summaries_lower:
             continue
 
-        # 内联 entities 提取（不从 recall_4layer 跨模块依赖）
+        # 内联 entities 提取
         _raw_ents = pl.get("entities") or []
         item_ents = [e for e in _raw_ents if e and isinstance(e, str) and e.strip()]
+
+        # 找真实 hop_depth：哪个扩散实体和这条记忆的 overlap 最高
+        best_hop = 1
+        best_path = [seed_entities[0]] if seed_entities else []
+        best_overlap = -1
+        for ent_key, ent_info in visited.items():
+            ent_original = ent_info["original"]
+            # 检查这个扩散实体是否在这条记忆的 entities 或 summary 里
+            ent_lower = ent_original.lower()
+            overlap_count = sum(
+                1 for ie in item_ents
+                if ie.lower() == ent_lower
+            )
+            overlap_count += 1 if ent_lower in summary.lower() else 0
+            if overlap_count > best_overlap:
+                best_overlap = overlap_count
+                best_hop = ent_info["hop"]
+                best_path = ent_info["path"]
+
+        # 如果没有匹配到扩散实体，用 hop=1 的 seed entity 作为路径起点
+        if best_overlap < 0:
+            best_hop = 1
+            for seed_e in seed_entities:
+                if seed_e and seed_e.lower() in summary.lower():
+                    best_path = [seed_e]
+                    break
+            if not best_path:
+                best_path = [seed_entities[0]] if seed_entities else []
 
         assoc_score = _assoc_score_item(
             {**pl, "entities": item_ents},
             seed_ent_set,
-            hop_depth=1,
+            hop_depth=best_hop,
             config=config,
         )
         if assoc_score is None:
             continue
 
-        # 找触发实体（哪个 seed entity 触发了这条记忆）
-        trigger = "扩展查询"
-        trigger_path = []
-        for seed_e in seed_entities:
-            if seed_e and seed_e.lower() in summary.lower():
-                trigger = f"通过 {seed_e} 联想到"
-                trigger_path = [seed_e]
-                break
-        if not trigger_path and seed_entities:
-            trigger_path = [seed_entities[0]]
+        # 构造 recall_reason
+        trigger = "通过联想激活"
+        if best_path:
+            trigger = " → ".join(best_path)
 
         assoc_candidates.append({
             "summary": summary,
             "assoc_score": assoc_score,
-            "hop": 1,
+            "hop_depth": best_hop,          # 真实 hop
+            "association_path": best_path,   # 完整路径
             "recall_reason": trigger,
-            "association_path": trigger_path,
             "entities": item_ents,
-            "depth": 1,
             "source": "assoc_qdrant",
             "score": hit_dict.get("score", 0),
             "collection": coll,
@@ -726,7 +762,7 @@ def association_expand(query, seed_entities, seed_summaries, config, embed_fn=No
     if not assoc_candidates:
         return []
 
-    # 去重：同一 summary（前60字）只保留得分最高的
+    # 去重：同一 summary 只保留得分最高的
     seen_sum = {}
     for c in assoc_candidates:
         key = c["summary"][:60]
