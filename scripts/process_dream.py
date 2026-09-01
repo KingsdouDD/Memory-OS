@@ -1442,6 +1442,21 @@ def _gen_pid_v5(ko, collection=None):
     return int(hashlib.md5(pid_src).hexdigest()[:16], 16)
 
 
+def _gen_relation_pid(parent_pid, relations):
+    """Relation Point 的稳定 ID。
+    同一 parent_pid + 同一组 (subject, predicate, object) 永远生成相同 ID。
+    不再使用 uuid.uuid4()，彻底杜绝 UPDATE 时制造重复 relation point。
+    """
+    rel_parts = sorted(
+        f"{(r.get('subject') or '').strip()}|{r.get('predicate') or ''}|{(r.get('object') or '').strip()}"
+        for r in (relations or [])
+        if (r.get('subject') or '').strip() and (r.get('object') or '').strip()
+    )
+    fp = str(parent_pid) + "||" + "||".join(rel_parts)
+    return "rel_" + hashlib.md5(fp.encode("utf-8")).hexdigest()[:20]
+
+
+
 def _build_payload_v5(ko, kotype, imp, pid=None):
     """Qdrant payload 统一构造。"""
     return {
@@ -1636,8 +1651,7 @@ def _execute_create_v5(ko, kotype, collection, client, report):
             rel_vecs = embed(rel_text)
             if rel_vecs:
                 rel_vec = rel_vecs[0] if isinstance(rel_vecs[0], list) else rel_vecs
-                import uuid as _uuid
-                rel_pid = str(_uuid.uuid4())
+                rel_pid = _gen_relation_pid(pid, ko.get("relations") or [])
                 rel_payload = dict(payload)
                 rel_payload["_point_type"] = "relation"
                 rel_payload["_parent_pid"] = pid
@@ -1742,8 +1756,7 @@ def _execute_update_v5(ko, kotype, collection, client, target_pid, report):
             rel_vecs = embed(rel_text)
             if rel_vecs:
                 rel_vec = rel_vecs[0] if isinstance(rel_vecs[0], list) else rel_vecs
-                import uuid as _uuid
-                rel_pid = str(_uuid.uuid4())
+                rel_pid = _gen_relation_pid(pid, ko.get("relations") or [])
                 rel_payload = dict(payload)
                 rel_payload["_point_type"] = "relation"
                 rel_payload["_parent_pid"] = pid
