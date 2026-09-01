@@ -31,7 +31,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from process_dream import embed, _qdrant_client
-from recall_fusion import fusion_post_fuse, fusion_boost_graph_hits, kg_verify_v2
+from recall_fusion import fusion_post_fuse, fusion_boost_graph_hits, kg_verify_v2, association_expand
 from recall_config import RecallConfig
 
 # ── Reranker 服务（Qwen3-Reranker-0.6B）──────────────────────────
@@ -580,6 +580,45 @@ def recall_4layer(query, top_k=5, layers=None):
             if sid and sid not in filter_scenario_ids:
                 filter_scenario_ids.append(sid)
 
+    # ── Step 2.5: 从 L3/L2 hits 的 summary 里提取种子实体 ────────
+    # 当 filter_entities 仍为空时，从已有 hits 的 summary 文本提取名词作为种子
+    if not filter_entities:
+        import jieba
+        _STOP = {
+            "的", "了", "在", "是", "有", "和", "就", "不", "都",
+            "一", "上", "也", "很", "到", "去", "会", "着", "好",
+            "这", "那", "吗", "吧", "啊", "呢", "哦", "嗯", "呀",
+            "是", "一个", "自己", "没有", "什么", "怎么", "可以",
+        }
+        all_hit_summaries = (
+            [h.get("summary", "") for h in persona if h.get("summary")]
+            + [h.get("title", "") for h in scenario if h.get("title")]
+            + [h.get("summary", "") for h in scenario if h.get("summary")]
+        )
+        for text in all_hit_summaries:
+            for w in jieba.cut(text):
+                word = w.strip()
+                if not word or len(word) < 2 or word in _STOP:
+                    continue
+                # 接受常见实体词性：人名(nrt)、地名(ns)、机构名(nt)、普通名词(n)
+                # jieba.cut 不返回词性，改用 posseg
+                pass
+        # 用 posseg 提取
+        try:
+            import jieba.posseg as pseg
+            for text in all_hit_summaries:
+                for w in pseg.cut(text):
+                    word = w.word.strip()
+                    if not word or len(word) < 2 or word in _STOP:
+                        continue
+                    # 接受：人名(nrt/nr)、地名(ns)、机构名(nt)、名词(n/m)
+                    # 以及含语义词的复合词
+                    if any(w.flag.startswith(p) for p in ("n", "m")) or w.flag in ("x", "g"):
+                        if word not in filter_entities:
+                            filter_entities.append(word)
+        except Exception:
+            pass
+
     # ── Step 3: graph 通道 → 检查是否触发 PRF ───────────────────
     graph_prf_triggered = False
     if "L1" in layers and filter_entities:
@@ -675,9 +714,136 @@ def recall_4layer(query, top_k=5, layers=None):
             atom.sort(key=lambda x: -x.get("final_score", 0))
             atom = atom[:top_k]
 
-    all_memories = [_format_memory_with_time(m) for m in atom if m.get("summary")]
+    # ── Step 6: Association Expansion（联想记忆）────────────────────
+    # 如果 L3/L2 有召回 entities → 用 filter_entities 启动联想
+    # 如果没有 → 从 query 文本用 jieba 提取名词实体作为种子
+    assoc_candidates = []
+    assoc_triggered = False
+
+    # Fallback：当 L3/L2 没有召回实体时，从 query 本身提取候选实体
+    # 策略：jieba 分词（名词/动词/复合词）+ query 全文本都当种子
+    q_filter_entities = list(filter_entities)
+    if RecallConfig.ASSOC_ENABLED and not q_filter_entities:
+        try:
+            import jieba.posseg as pseg
+            # 只过滤纯语法词/语气词，不过滤内容词（工作/想/找 都要留）
+            _STOP = {
+                "的", "了", "在", "是", "有", "和", "就", "不", "都",
+                "一", "上", "也", "很", "到", "去", "会", "着", "好",
+                "这", "那", "吗", "吧", "啊", "呢", "哦", "嗯", "呀",
+            }
+            for w in pseg.cut(query):
+                word = w.word.strip()
+                if not word or len(word) < 2 or word in _STOP:
+                    continue
+                # 接受：名词(n*/nr/ns/nt/nz)、动词(v*/vn)、人名(nr)、地名(ns)
+                # 也接受 x(字母数字)、g(其他)：捕捉"职业规划"这类复合词
+                if any(w.flag.startswith(p) for p in ("n", "v", "x", "g")):
+                    if word not in q_filter_entities:
+                        q_filter_entities.append(word)
+        except Exception:
+            pass
+
+        # 如果提取出的实体太少（< 2个），直接用 query 全文本作为种子
+        if len(q_filter_entities) < 2:
+            q_filter_entities.append(query.strip())
+
+    if RecallConfig.ASSOC_ENABLED and q_filter_entities:
+        # 收集 seed summaries（persona + scenario）
+        seed_summaries = (
+            [p.get("summary", "") for p in persona if p.get("summary")]
+            + [s.get("summary", "") for s in scenario if s.get("summary")]
+            + [s.get("title", "") for s in scenario if s.get("title")]
+        )
+        assoc_candidates = association_expand(
+            query=query,
+            seed_entities=filter_entities,
+            seed_summaries=seed_summaries,
+            config=RecallConfig,
+            embed_fn=embed,
+        )
+        assoc_triggered = len(assoc_candidates) > 0
+
+        if assoc_triggered:
+            # 对联想候选做 reranker 精排（用 seed recall 的 reranker）
+            assoc_summaries = [c.get("summary", "") for c in assoc_candidates]
+            assoc_reranked = _rerank_via_http(query, assoc_summaries, top_k=len(assoc_summaries))
+            assoc_rerank_map = {idx: score for idx, score in assoc_reranked}
+
+            has_reranker = len(assoc_rerank_map) > 0
+            for i, c in enumerate(assoc_candidates):
+                rr = assoc_rerank_map.get(i)
+                if rr is not None:
+                    c["rerank_score"] = rr
+                    # 有 reranker 分数时：综合评分
+                    c["final_score"] = round(
+                        rr * 0.6 + c.get("assoc_score", 0) * 0.4,
+                        4,
+                    )
+                else:
+                    # reranker 失败（服务冷启动）时：用 assoc_score 作为 final_score
+                    c["rerank_score"] = 0.0
+                    c["final_score"] = c.get("assoc_score", 0)
+
+            # P(yes) < 0.55 的联想候选丢弃（reranker 失败时改为 assoc_score 阈值）
+            if has_reranker:
+                assoc_candidates = [
+                    c for c in assoc_candidates
+                    if (c.get("rerank_score", 0) >= 0.55 or c.get("assoc_score", 0) >= 0.65)
+                ]
+            else:
+                # reranker 不可用：只靠 assoc_score 筛选（> 0.60）
+                assoc_candidates = [
+                    c for c in assoc_candidates
+                    if c.get("assoc_score", 0) >= 0.60
+                ]
+            assoc_candidates.sort(key=lambda x: -x.get("final_score", 0))
+            assoc_candidates = assoc_candidates[:top_k]
+
+            # 标记这些是联想来的记忆
+            for c in assoc_candidates:
+                c["_is_assoc"] = True
+
+    # ── 合并 seed atom + association candidates ───────────────────
+    # 去重：用完整 summary 精确匹配（避免 60字前缀误判重复）
+    seed_summaries_full = {m.get("summary", "") for m in atom}
+
+    # 统一格式：给 atom 的记忆也补 recall_reason
+    for m in atom:
+        if "recall_reason" not in m:
+            m["recall_reason"] = "直接匹配"
+
+    merged_atom = list(atom)
+    for c in assoc_candidates:
+        full_sum = c.get("summary", "")
+        # 完整 summary 精确匹配去重
+        if full_sum and full_sum not in seed_summaries_full:
+            merged_atom.append({
+                "summary": full_sum,
+                "relation": c.get("relation", "") or "",
+                "score": c.get("score", 0),
+                "rerank_score": c.get("rerank_score", 0),
+                "final_score": c.get("final_score", 0),
+                "source": c.get("source", "assoc"),
+                "_qdrant_pid": c.get("_qdrant_pid"),
+                "importance": c.get("importance", 0.5),
+                "event_time": c.get("event_time") or {},
+                "valid_time": c.get("valid_time") or {},
+                "ts": c.get("ts", ""),
+                "tags": c.get("tags") or [],
+                "entities": c.get("entities") or [],
+                "recall_reason": c.get("recall_reason", "通过联想激活"),
+                "association_path": c.get("association_path", []),
+                "_is_assoc": True,
+            })
+
+    # 最终排序（按 final_score 降序）
+    merged_atom.sort(key=lambda x: -x.get("final_score", x.get("score", 0)))
+    merged_atom = merged_atom[:top_k]
+
+    all_memories = [_format_memory_with_time(m) for m in merged_atom if m.get("summary")]
     overlap_avg = (
-        sum(m.get("entity_overlap", 0) for m in atom) / max(len(atom), 1)
+        sum(m.get("entity_overlap", 0) for m in merged_atom) / max(len(merged_atom), 1)
     )
 
     return {
@@ -685,13 +851,16 @@ def recall_4layer(query, top_k=5, layers=None):
         "layers": layers,
         "persona": persona,
         "scenario": scenario,
-        "atom": atom,
+        "atom": merged_atom,
+        "assoc_candidates": assoc_candidates if assoc_triggered else [],
         "raw": [],
         "memories": all_memories,
         "context": {
             "filter_entities": filter_entities,
             "filter_scenario_ids": filter_scenario_ids,
             "graph_prf_triggered": graph_prf_triggered,
+            "assoc_triggered": assoc_triggered,
+            "assoc_candidate_count": len(assoc_candidates),
             "entity_overlap_avg": round(overlap_avg, 3),
         },
     }
@@ -724,6 +893,9 @@ def recall_for_hook(query, top_k=8, rrf_k=None):
     memories = [m for m in memories if m]
 
     ctx = result.get("context", {})
+    assoc_cands = result.get("assoc_candidates") or []
+    # 统计联想来源的记忆条数
+    assoc_mem_count = sum(1 for m in atom if m.get("_is_assoc"))
     channels = {
         "vec": 0,
         "bm25": 0,
@@ -734,7 +906,10 @@ def recall_for_hook(query, top_k=8, rrf_k=None):
         "aux_persona": len(result.get("persona", [])),
         "aux_scenario": len(result.get("scenario", [])),
         "l1_atom_count": len(atom),
+        "assoc_count": assoc_mem_count,
+        "assoc_candidates": ctx.get("assoc_candidate_count", 0),
         "graph_prf_triggered": ctx.get("graph_prf_triggered", False),
+        "assoc_triggered": ctx.get("assoc_triggered", False),
         "entity_overlap_avg": ctx.get("entity_overlap_avg", 0),
         "filter_entities": ctx.get("filter_entities", [])[:5],
     }

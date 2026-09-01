@@ -164,7 +164,7 @@ _DEFAULT_WRITE_ANN_RECALL_THRESHOLD = 0.80   # ANN 召回门槛（召回宽，�
 _DEFAULT_WRITE_DECISION_TOP_K = 3            # 召回候选数（top-K 给 LLM 看）
 _DEFAULT_WRITE_DECISION_TEMPERATURE = 0.1    # LLM 决策温度（0.1 = 准确定性 + 防 thinking 循环）
 _DEFAULT_WRITE_DECISION_MAX_TOKENS = 500     # LLM 决策输出上限
-_DEFAULT_WRITE_DECISION_MODEL = "MiniMax-M3  # 决策专用模型（开发者 2026-08-10 拍：M3 输出更稳）
+_DEFAULT_WRITE_DECISION_MODEL = "MiniMax-M3"  # 决策专用模型（M3 输出更稳）
 _DEFAULT_WRITE_DECISION_LOG_PATH = str(Path.home()) + "/.openclaw/workspace/memory-os/logs/write-decision.md"
 
 # 会话级 query 去重缓存
@@ -347,6 +347,32 @@ class RecallConfig:
     # 调试日志
     RECALL_DEBUG = _env_str(
         "MEMORY_OS_RECALL_DEBUG", _DEFAULT_RECALL_DEBUG
+    )
+
+        # ── 2026-09-01 联想记忆（Association Expansion）──
+    # 最大扩散 hops（1=种子直接关联，2=关联的关联，3=关联的关联的关联）
+    ASSOC_MAX_HOPS = _env_int(
+        "MEMORY_OS_ASSOC_MAX_HOPS", 2
+    )
+    # 每 hop 最大扩展实体数
+    ASSOC_MAX_NEIGHBORS = _env_int(
+        "MEMORY_OS_ASSOC_MAX_NEIGHBORS", 6
+    )
+    # 扩散激活阈值：entity overlap 低于此值不进入下一 hop
+    ASSOC_ACTIVATION_THRESHOLD = _env_float(
+        "MEMORY_OS_ASSOC_ACTIVATION_THRESHOLD", 0.1
+    )
+    # depth 衰减系数：每多 1 hop，乘以 decay（0.5 表示每跳减半）
+    ASSOC_DEPTH_DECAY = _env_float(
+        "MEMORY_OS_ASSOC_DEPTH_DECAY", 0.5
+    )
+    # Association Expansion 最大候选数（进入 reranker 前截断）
+    ASSOC_MAX_CANDIDATES = _env_int(
+        "MEMORY_OS_ASSOC_MAX_CANDIDATES", 20
+    )
+    # 是否启用 Association Expansion（0=关闭，1=开启）
+    ASSOC_ENABLED = _env_int(
+        "MEMORY_OS_ASSOC_ENABLED", 1
     )
 
     # ---- 自检 / dump ----

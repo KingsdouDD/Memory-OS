@@ -499,6 +499,244 @@ def fusion_graphrag_hooks(graph_channel_items):
 
 
 # ============================================================
+# 2026-09-01 联想记忆：Association Expansion
+# ============================================================
+
+def _entity_overlap(query_entities, item_entities):
+    """计算 entity 重叠率（交集 / query 实体数），返回 0.0~1.0。"""
+    if not query_entities or not item_entities:
+        return 0.0
+    qset = set(e.strip().lower() for e in query_entities if e and len(e.strip()) >= 2)
+    iset = set(e.strip().lower() for e in item_entities if e and len(e.strip()) >= 2)
+    if not qset:
+        return 0.0
+    return len(qset & iset) / len(qset)
+
+def _assoc_score_item(item, seed_entities, hop_depth, config):
+    """综合多维信号计算 Association Score。
+
+    综合：
+      - entity_overlap：这条记忆和种子实体的重叠率
+      - graph_depth： hop 越远衰减越多
+      - temporal_relevance：时间越近分越高
+      - importance：写入时的重要性评分
+      - activation_strength：被共同激活的次数（初期暂无）
+    """
+    decay = config.ASSOC_DEPTH_DECAY  # 每 hop 乘以的衰减系数
+    threshold = config.ASSOC_ACTIVATION_THRESHOLD
+
+    # 1. entity overlap
+    item_ents = item.get("entities") or []
+    overlap = _entity_overlap(seed_entities, item_ents)
+
+    # 2. depth decay
+    depth_score = max(0.0, decay ** max(0, hop_depth - 1))
+
+    # 3. temporal（越近越高，半年内满，2年以上衰减到 0.5）
+    temporal_score = 1.0
+    ts = _parse_ts(item.get("ts") or "")
+    if ts:
+        delta_days = (datetime.now(CN_TZ) - ts).total_seconds() / 86400.0
+        temporal_score = max(0.5, 1.0 - delta_days / 540)  # 540天→0.5
+
+    # 4. importance
+    imp = float(item.get("importance", 0.5))
+
+    # 5. 综合分
+    # 权重：overlap 最重要（0.4），depth_decay 次之（0.25），
+    #        importance（0.2），temporal（0.15）
+    assoc_score = (
+        overlap * 0.4
+        + depth_score * 0.25
+        + imp * 0.2
+        + temporal_score * 0.15
+    )
+
+    # 低于激活阈值 → 丢弃
+    if overlap < threshold and hop_depth > 1:
+        return None
+
+    return round(assoc_score, 4)
+
+def association_expand(query, seed_entities, seed_summaries, config, embed_fn=None):
+    """Association Expansion（2026-09-01 重写）：
+    沿着实体/概念网络扩散，召回关联记忆。
+
+    简化设计：
+      1. Hop 扩散：从 seed entities 出发，在 Neo4j 图里扩散 N 跳，
+         收集所有跳到的关联实体
+      2. Expansion query：用 seed summaries + 扩散收集到的 entities
+         一起构造 expansion text，生成向量
+      3. Qdrant 召回：用 expansion vector 召回所有层的记忆
+      4. Association scoring：按 entity overlap + depth_decay + importance 评分
+      5. 去重过滤：剔除与 seed summaries 完全重复的结果
+
+    Args:
+      query: 用户原始 query
+      seed_entities: 从 L3/L2 召回提取的种子实体列表（字符串）
+      seed_summaries: 从 L3/L2 召回提取的种子 summary 列表
+      config: RecallConfig 实例
+      embed_fn: embed 函数
+
+    Returns:
+      [{"summary": ..., "assoc_score": ..., "hop": ..., "recall_reason": ...,
+        "association_path": [...], "entities": [...], "score": 0,
+        "source": "assoc_qdrant", ...}]
+    """
+    if embed_fn is None:
+        from process_dream import embed
+        embed_fn = embed
+
+    if not seed_entities:
+        return []
+
+    if not config.ASSOC_ENABLED:
+        return []
+
+    seed_ent_set = {e.strip().lower() for e in seed_entities if e and len(e.strip()) >= 2}
+    if not seed_ent_set:
+        return []
+
+    seed_summaries_lower = {s.lower() for s in (seed_summaries or []) if s}
+
+    # ── Step 1: Hop 扩散，收集关联实体 ──────────────────────────
+    from process_dream import neo4j_expand
+    visited_entities = dict()   # key: lowercase name, value: original name
+    for e in seed_entities:
+        if e and len(e.strip()) >= 2:
+            visited_entities[e.strip().lower()] = e.strip()
+
+    current_entities = [e for e in seed_entities if e and len(e.strip()) >= 2]
+
+    for hop in range(1, config.ASSOC_MAX_HOPS + 1):
+        if not current_entities:
+            break
+        next_entities = []
+        for ent_name in current_entities[:config.ASSOC_MAX_NEIGHBORS]:
+            try:
+                neighbors = neo4j_expand([ent_name], depth=1,
+                                         limit_per_node=config.ASSOC_MAX_NEIGHBORS)
+            except Exception:
+                continue
+
+            for n in neighbors:
+                for t in (n.get("raw_triples") or []):
+                    for name in ((t.get("subj") or "").strip(),
+                                  (t.get("obj") or "").strip()):
+                        key = name.lower()
+                        if key and key not in visited_entities and len(name) >= 2:
+                            visited_entities[key] = name
+                            next_entities.append(name)
+        current_entities = next_entities
+        if not current_entities:
+            break
+
+    # ── Step 2: 构造 expansion text + vector ─────────────────────
+    all_ent_names = list(visited_entities.values())
+    exp_parts = [query]
+    if seed_summaries:
+        exp_parts.extend(seed_summaries[:3])
+    # 加入扩散实体的名字（增强主题）
+    exp_parts.extend(all_ent_names[:15])
+    expansion_text = " ".join(exp_parts)
+
+    try:
+        exp_vecs = embed_fn(expansion_text)
+        if not exp_vecs:
+            return []
+        exp_vec = exp_vecs[0] if isinstance(exp_vecs[0], list) else exp_vecs
+    except Exception:
+        return []
+
+    # ── Step 3: Qdrant 向量召回 ─────────────────────────────────
+    try:
+        from process_dream import _qdrant_client, qdrant_search
+        from recall_config import RecallConfig as RC
+        all_collections = list(RC.COLLECTIONS) + ["memory_scenario", "memory_persona"]
+        seen_col, uniq_col = set(), []
+        for c in all_collections:
+            if c not in seen_col:
+                seen_col.add(c)
+                uniq_col.append(c)
+        hits = qdrant_search(exp_vec, uniq_col, top_k=config.ASSOC_MAX_CANDIDATES)
+    except Exception:
+        return []
+
+    if not hits:
+        return []
+
+    # hits 格式：[(coll, {"id": ..., "score": ..., "payload": ...}), ...]
+    # ── Step 4: 多维 Association Scoring ────────────────────────
+    assoc_candidates = []
+    for coll, hit in hits:
+        # hit 本身是 dict，包含 id/score/payload
+        hit_dict = hit if isinstance(hit, dict) else {}
+        pl = hit_dict.get("payload") or {}
+        summary = pl.get("summary") or ""
+        if not summary:
+            continue
+
+        # 过滤：与 seed summary 完全相同的不要
+        if summary.lower() in seed_summaries_lower:
+            continue
+
+        # 内联 entities 提取（不从 recall_4layer 跨模块依赖）
+        _raw_ents = pl.get("entities") or []
+        item_ents = [e for e in _raw_ents if e and isinstance(e, str) and e.strip()]
+
+        assoc_score = _assoc_score_item(
+            {**pl, "entities": item_ents},
+            seed_ent_set,
+            hop_depth=1,
+            config=config,
+        )
+        if assoc_score is None:
+            continue
+
+        # 找触发实体（哪个 seed entity 触发了这条记忆）
+        trigger = "扩展查询"
+        trigger_path = []
+        for seed_e in seed_entities:
+            if seed_e and seed_e.lower() in summary.lower():
+                trigger = f"通过 {seed_e} 联想到"
+                trigger_path = [seed_e]
+                break
+        if not trigger_path and seed_entities:
+            trigger_path = [seed_entities[0]]
+
+        assoc_candidates.append({
+            "summary": summary,
+            "assoc_score": assoc_score,
+            "hop": 1,
+            "recall_reason": trigger,
+            "association_path": trigger_path,
+            "entities": item_ents,
+            "depth": 1,
+            "source": "assoc_qdrant",
+            "score": hit_dict.get("score", 0),
+            "collection": coll,
+            "_qdrant_pid": hit_dict.get("id"),
+            "importance": pl.get("importance", 0.5),
+            "event_time": pl.get("event_time") or {},
+            "valid_time": pl.get("valid_time") or {},
+            "ts": pl.get("ts", ""),
+            "tags": pl.get("tags") or [],
+        })
+
+    if not assoc_candidates:
+        return []
+
+    # 去重：同一 summary（前60字）只保留得分最高的
+    seen_sum = {}
+    for c in assoc_candidates:
+        key = c["summary"][:60]
+        if key not in seen_sum or c["assoc_score"] > seen_sum[key]["assoc_score"]:
+            seen_sum[key] = c
+
+    result = sorted(seen_sum.values(), key=lambda x: -x["assoc_score"])
+    return result[:config.ASSOC_MAX_CANDIDATES]
+
+# ============================================================
 # 自检
 # ============================================================
 
