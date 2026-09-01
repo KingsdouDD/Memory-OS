@@ -69,7 +69,7 @@ memory_preference / memory_routine / memory_concept / memory_relation
 ## 目录结构
 
 ```
-memory-os-plugin/          # ⬆ 上传到 GitHub 的插件代码
+memory-os-plugin/          # 
 ├── src/
 │   └── index.js           # 插件入口，Hook 注册 + 4 个 MCP 工具
 ├── scripts/
