@@ -19,16 +19,21 @@ Neo4j + Qdrant 长期记忆系统 — OpenClaw 插件
    │ 通过
    ▼
 ┌─────────────────────────────┐
-│    4-Chain Recall（融合）    │  recall_fusion.py
-│  ┌─────────────────────┐   │
-│  │ BM25 关键词通道        │   │
-│  │ Vector × 8 collection │   │
-│  │ Knowledge Graph 1-hop │   │
-│  └─────────────────────┘   │
-│         ↓ RRF 融合          │
-│    kg_verify 图谱校验        │
-│    importance 加权           │
-│    time_decay 时间衰减        │
+│      4-Layer Recall         │  recall_4layer.py
+│  ┌─────────────────────────┐│
+│  │ Step 1-2: L3/L2 召回     ││
+│  │ 提取 filter_entities     ││
+│  │ Step 2.5: 实体补充       ││
+│  │ Step 3: Graph PRF        ││
+│  │ Step 4: L1 主召回        ││
+│  │ (向量+BM25+Graph RRF)   ││
+│  │ Step 5: Pre-filter      ││
+│  │ Step 6: Association     ││  ← 联想记忆扩散（2026-09-01）
+│  │ (Neo4j多跳扩散+Qdrant) ││
+│  └─────────────────────────┘│
+│         ↓ 合并去重            │
+│    统一一次 Reranker         │
+│    Pre-filter + Final Top-K │
 └─────────────────────────────┘
    │
    ▼
@@ -315,6 +320,17 @@ LLM 抽取 4 层记忆时，按 `scripts/extract_prompt.md` 的规范执行。
 | `MEMORY_OS_VEC_MIN_SCORE` | 0.60 | 向量召回最低相似度 |
 | `MEMORY_OS_GRAPH_DEPTH` | 1 | 图召回跳数（默认 1 跳，避免带偏） |
 | `MEMORY_OS_RRF_K` | 60 | RRF 融合参数 |
+
+### Association Expansion 联想记忆（2026-09-01 新增）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `ASSOC_ENABLED` | 1 | 联想扩散开关，0=关闭 |
+| `ASSOC_MAX_HOPS` | 2 | Neo4j 最大扩散跳数 |
+| `ASSOC_MAX_NEIGHBORS` | 6 | 每跳最多扩展邻居数 |
+| `ASSOC_ACTIVATION_THRESHOLD` | 0.1 | 联想激活阈值（低于此且 hop>1 丢弃） |
+| `ASSOC_DEPTH_DECAY` | 0.5 | hop 深度衰减系数（每多一跳 ×0.5） |
+| `ASSOC_MAX_CANDIDATES` | 20 | 最多联想候选数 |
 
 ### Hook 门控
 
