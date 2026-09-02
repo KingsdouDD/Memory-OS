@@ -7,60 +7,60 @@
 [![Node.js](https://img.shields.io/badge/node-V26%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![Python](https://img.shields.io/badge/python-3.14-3776ab?logo=python&logoColor=white)](https://www.python.org/)
 
-Neo4j + Qdrant 长期记忆系统 — OpenClaw 插件
+Neo4j + Qdrant Long-Term Memory System — OpenClaw Plugin
 
-四层记忆架构（L0/L1/L2/L3），兼顾向量检索与知识图谱，支持主动注入、被动召回、LLM 自我反思写入。
+4-layer memory architecture (L0/L1/L2/L3) combining vector search and knowledge graphs, supporting proactive injection, passive recall, and LLM self-reflection writes.
 
 ---
 
-## 架构总览
+## Architecture Overview
 
 ```
-用户输入
+User Input
    │
    ▼
 ┌───────────────────────────────────────┐
-│         Hook Gate（门控）               │  recall_gate.py
-│   长度 / 纯情绪 / 粗口过滤            │
+│         Hook Gate                      │  recall_gate.py
+│   Length / emotion / profanity filter  │
 └───────────────────────────────────────┘
-   │ 通过
+   │ Pass
    ▼
 ┌───────────────────────────────────────┐
 │         4-Layer Recall                │  recall_4layer.py
 │                                       │
-│  Step 1-2: L3/L2 高置信召回          │
-│  Step 2.5: 实体补充（jieba）         │
-│  Step 3: Graph PRF（Neo4j 1-hop）   │
-│  Step 4: L1 主召回（vec+BM25+RRF）   │
-│  Step 5: Pre-filter（entity overlap）│
-│  Step 6: Association Expansion         │  ← Neo4j 多跳扩散 + Qdrant
-│         ↓ 合并去重                    │
-│    统一一次 Reranker 精排            │
+│  Step 1-2: L3/L2 High-Confidence     │
+│  Step 2.5: Entity Augment (jieba)     │
+│  Step 3: Graph PRF (Neo4j 1-hop)     │
+│  Step 4: L1 Main Recall (vec+BM25+RRF)│
+│  Step 5: Pre-filter (entity overlap)  │
+│  Step 6: Association Expansion         │  ← Neo4j multi-hop + Qdrant
+│         ↓ Deduplicate                 │
+│    Single Reranker Pass               │
 │    Final Top-K                        │
 └───────────────────────────────────────┘
    │
    ▼
 ┌───────────────────────────────────────┐
 │       Memory Injection                │  src/index.js
-│   【共同记忆】+ 自然语气              │
+│   [Shared Memory] + Natural tone      │
 └───────────────────────────────────────┘
    │
    ▼
-  LLM 输出（已注入记忆）
+  LLM Output (with injected memories)
 ```
 
 ---
 
-## 四层记忆设计
+## 4-Layer Memory Design
 
-| 层 | 名称 | Qdrant collection | PID 策略 | 召回优先级 |
-|----|------|-------------------|----------|------------|
-| **L0** | 原始场景 | `memory_l0` | UUID | 最低（托底）|
-| **L1** | 原子记忆 | `memory_<type>`（8 个 collection）| md5 指纹 | 中 |
-| **L2** | 场景记忆 | `memory_scenario` | UUID | 高 |
-| **L3** | 长期画像 | `memory_persona` | UUID | 最高 |
+| Layer | Name | Qdrant Collection | PID Strategy | Recall Priority |
+|-------|------|-------------------|--------------|----------------|
+| **L0** | Raw Scene | `memory_l0` | UUID | Lowest (fallback) |
+| **L1** | Atomic Memory | `memory_<type>` (8 collections) | md5 fingerprint | Medium |
+| **L2** | Scenario | `memory_scenario` | UUID | High |
+| **L3** | Long-Term Persona | `memory_persona` | UUID | Highest |
 
-### L1 的 8 个 Collection
+### L1 8 Collections
 
 ```
 memory_atom / memory_fact / memory_event / memory_experience
@@ -69,27 +69,27 @@ memory_preference / memory_routine / memory_concept / memory_relation
 
 ---
 
-## 目录结构
+## Directory Structure
 
 ```
-memory-os-plugin/          # ← OpenClaw 插件根目录
+memory-os-plugin/          # ← OpenClaw plugin root
 ├── src/
-│   └── index.js         # 插件入口，Hook 注册 + 4 个 MCP 工具
+│   └── index.js         # Plugin entry, Hook registration + 4 MCP tools
 ├── scripts/
-│   ├── recall_4layer.py    # 4 层融合召回
-│   ├── recall_fusion.py     # RRF 融合 + graph boost + time decay
-│   ├── recall_config.py     # 召回超参数中心
-│   ├── recall_gate.py       # Hook 门控
-│   ├── recall_stats.py      # 各 collection 统计
-│   ├── write_4layer.py     # 4 层写入/更新/删除（Python CLI）
-│   ├── process_dream.py     # Embedding + Qdrant 底层
-│   ├── extract_prompt.md    # LLM 4 层抽取规范
-│   ├── embed_daemon.py      # Embedding HTTP 守护进程（本地 GGUF）
-│   ├── reranker_daemon.py  # Reranker HTTP 守护进程
-│   ├── bm25_index.py        # BM25 全文索引
-│   ├── service_lifecycle.py  # 服务启停管理
-│   ├── cron_runner.py        # 定时任务（梦境入库）
-│   └── *dedup*.py / *clean*.py  # 运维工具
+│   ├── recall_4layer.py    # 4-layer fusion recall
+│   ├── recall_fusion.py     # RRF fusion + graph boost + time decay
+│   ├── recall_config.py     # Recall hyperparameter center
+│   ├── recall_gate.py       # Hook gate
+│   ├── recall_stats.py      # Collection statistics
+│   ├── write_4layer.py     # 4-layer write/update/delete (Python CLI)
+│   ├── process_dream.py     # Embedding + Qdrant low-level
+│   ├── extract_prompt.md    # LLM 4-layer extraction spec
+│   ├── embed_daemon.py      # Embedding HTTP daemon (local GGUF)
+│   ├── reranker_daemon.py  # Reranker HTTP daemon
+│   ├── bm25_index.py        # BM25 full-text index
+│   ├── service_lifecycle.py  # Service start/stop management
+│   ├── cron_runner.py        # Cron jobs (dream ingestion)
+│   └── *dedup*.py / *clean*.py  # DevOps tools
 ├── config/
 ├── logs/
 ├── openclaw.plugin.json
@@ -98,35 +98,35 @@ memory-os-plugin/          # ← OpenClaw 插件根目录
 ├── README_recall.md
 └── MEMORY-OS-4LAYER.md
 
-memory-os/                 # ← 本地运行时数据（独立目录）
+memory-os/                 # ← Local runtime data (separate directory)
 ├── venv/
 ├── models/
 ├── neo4j/
 ├── qdrant/
-├── tokens/                # delete/update token（TTL 30 分钟）
+├── tokens/                # delete/update token (TTL 30 min)
 └── logs/
 ```
 
 ---
 
-## 环境依赖
+## Environment Dependencies
 
-### 必须服务
+### Required Services
 
-| 服务 | 端口 | 启动方式 |
-|------|------|---------|
+| Service | Port | Start Command |
+|---------|------|---------------|
 | **Neo4j** | 7474 / 7687 | `brew services start neo4j` |
 | **Qdrant** | 6333 / 6334 | `brew services start qdrant` |
 | **Embed Daemon** | 8765 | `launchctl kickstart gui/501/com.memoryos.embed-daemon` |
 | **Reranker Daemon** | 8877 | `launchctl kickstart gui/501/com.memoryos.reranker` |
 
-> 插件启动时会自动检测服务状态，未启动时自动拉起。
+> Plugin auto-detects service status and starts them if down.
 >
-> **自检报告**：插件每次启动时自动跑 11 项质检（Python环境/包/脚本/模型/Token目录/4个服务端口/Neo4j认证/Qdrant API），FAIL 项打印修复命令，WARN 项提醒，全部通过则 ✅ 通过。
+> **Self-Check**: Plugin runs 11-item quality checks on every startup (Python env / packages / scripts / models / token dir / 4 service ports / Neo4j auth / Qdrant API). FAIL items print fix commands; WARN items warn; all pass → ✅.
 
-### Embedding 模型
+### Embedding Model
 
-默认使用本地 BGE-M3（GGUF/MLX 格式，Metal 加速）：
+Default: local BGE-M3 (GGUF/MLX, Metal accelerated):
 
 ```
 ~/.openclaw/workspace/memory-os/models/bge-m3-Q8_0.gguf
@@ -134,11 +134,11 @@ memory-os/                 # ← 本地运行时数据（独立目录）
 
 ---
 
-## 安装配置
+## Installation
 
-### 1. 配置环境变量
+### 1. Configure Environment Variables
 
-在 `memory-os-plugin/` 目录创建 `.env`：
+Create `.env` in `memory-os-plugin/`:
 
 ```bash
 MEMORY_OS_NEO4J_URI=bolt://127.0.0.1:7687
@@ -150,57 +150,57 @@ MEMORY_OS_EMBEDDING_MODEL=~/.openclaw/workspace/memory-os/models/bge-m3-Q8_0.ggu
 MEMORY_OS_HOOK_TRACE_ENABLED=1
 ```
 
-### 2. 启动服务（可选手动，插件会自动拉起）
+### 2. Start Services (optional, plugin auto-starts)
 
 ```bash
 python3 scripts/service_lifecycle.py start-all
 python3 scripts/service_lifecycle.py status
 ```
 
-> **提示**：插件启动时会自动检测并拉起未运行的服务，手动启动仅在需要时使用。
+> Tip: Plugin auto-detects and starts services. Manual start only when needed.
 
-### 3. 插件自检（自动执行）
+### 3. Plugin Self-Check (automatic)
 
-插件每次加载时自动跑 11 项质检，无需手动触发。自检内容包括：
+Plugin runs 11 quality checks on every load. Checks include:
 
-| 检查项 | 说明 |
-|--------|------|
-| Python 环境 + 版本 | Python 可执行文件是否可用 |
-| `neo4j` / `qdrant_client` / `jieba` 包 | 是否安装及版本 |
-| 关键脚本文件 | `write_4layer.py` / `recall_4layer.py` / `process_dream.py` |
-| Embedding 模型文件 | GGUF 文件是否存在 |
-| Token 目录可写性 | `~/.openclaw/workspace/memory-os/tokens/` |
-| 4 个服务端口 | Neo4j / Qdrant / Embed Daemon / Reranker Daemon |
-| Neo4j bolt 认证 | 用户名密码连通性 |
+| Check | Description |
+|-------|-------------|
+| Python env + version | Python executable availability |
+| `neo4j` / `qdrant_client` / `jieba` packages | Installed and version |
+| Key script files | `write_4layer.py` / `recall_4layer.py` / `process_dream.py` |
+| Embedding model file | GGUF file existence |
+| Token directory writability | `~/.openclaw/workspace/memory-os/tokens/` |
+| 4 service ports | Neo4j / Qdrant / Embed Daemon / Reranker Daemon |
+| Neo4j bolt auth | Username/password connectivity |
 | Qdrant REST API | `GET /readyz` HTTP 200 |
 
-FAIL 项示例输出（打印修复命令）：
+FAIL item example output:
 
 ```
-🍊 Memory OS 自检报告
-  ✅ Python 环境          3.11.0
-  ✅   包: neo4j         5.x.x
-  ✅   包: qdrant_client   ok
-  ✅   包: jieba           ok
-  ✅   脚本: write_4layer.py   存在
-  ✅   Embedding 模型     bge-m3-Q8_0.gguf
-  ✅   Token 目录         可写
-  ❌  Neo4j 服务          端口 7687 未监听
-                              请运行: brew services start neo4j
-  ✅  Qdrant 服务          端口 6333 在线
-  ✅  Embed Daemon        端口 8765 在线
-  ✅  Reranker Daemon     端口 8877 在线
+🍊 Memory OS Self-Check
+  ✅ Python env              3.11.0
+  ✅   pkg: neo4j         5.x.x
+  ✅   pkg: qdrant_client   ok
+  ✅   pkg: jieba           ok
+  ✅   Script: write_4layer.py   exists
+  ✅   Embedding model     bge-m3-Q8_0.gguf
+  ✅   Token dir         writable
+  ❌  Neo4j Service         port 7687 not listening
+                              Run: brew services start neo4j
+  ✅  Qdrant Service         port 6333 online
+  ✅  Embed Daemon           port 8765 online
+  ✅  Reranker Daemon        port 8877 online
 ══════════════════════════════════════════════
-  ❌  共 1 项不合格，请修复后再使用
+  ❌  1 item failed, please fix before use
 ```
 
 ---
 
-## 4 个 MCP 工具
+## 4 MCP Tools
 
-### `memory_os_ingest` — 存入记忆
+### `memory_os_ingest` — Store Memories
 
-**推荐方式**（4 层 JSON 字符串，避免 MCP 嵌套数组被展平）：
+**Recommended** (4-layer JSON string, avoids MCP nested array flattening):
 
 ```json
 {
@@ -208,29 +208,29 @@ FAIL 项示例输出（打印修复命令）：
 }
 ```
 
-**兼容老格式**（仅 L1）：
+**Legacy format** (L1 only):
 
 ```json
 {
   "kos": [
     {
       "type": "routine",
-      "summary": "某人的日常习惯",
+      "summary": "Someone's daily habit",
       "state": "ongoing",
-      "entities": [{"name": "某人", "label": "Person"}]
+      "entities": [{"name": "Someone", "label": "Person"}]
     }
   ],
-  "source": "微信对话:2026-09-02"
+  "source": "WeChat:2026-09-02"
 }
 ```
 
 ---
 
-### `memory_os_recall` — 查询记忆
+### `memory_os_recall` — Query Memories
 
 ```json
 {
-  "query": "某人的习惯",
+  "query": "Someone's habits",
   "top_k": 5,
   "include_persona": true,
   "include_scenario": true,
@@ -238,178 +238,178 @@ FAIL 项示例输出（打印修复命令）：
 }
 ```
 
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `query` | string | **必填** | 查询文本 |
-| `top_k` | integer | 5 | 每层返回条数 |
-| `include_persona` | boolean | true | 是否召回 L3 |
-| `include_scenario` | boolean | true | 是否召回 L2 |
-| `layers` | string | 全开 | 手控顺序，如 `"L3,L2"` |
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `query` | string | **required** | Query text |
+| `top_k` | integer | 5 | Results per layer |
+| `include_persona` | boolean | true | Include L3 |
+| `include_scenario` | boolean | true | Include L2 |
+| `layers` | string | all open | Manual order, e.g. `"L3,L2"` |
 
 ---
 
-### `memory_os_update` — 更新记忆
+### `memory_os_update` — Update Memories
 
-> **更新逻辑**：在旧内容后面**追加**新内容（L0-L3 长文本用 ` | ` 拼接），Neo4j 写新关系，旧关系保留。
+> **Update logic**: Appends new content after old content (L0-L3 long text joined by ` | `). Neo4j writes new relations; old relations kept.
 
-**快捷模式（推荐，跳过召回，直接更新）**：
+**Shortcut mode (recommended, skip recall)**:
 
 ```json
 {
-  "memory_json": "{\"l3\":{\"persona\":[{\"type\":\"preference\",\"summary\":\"新偏好\",\"state\":\"active\",\"importance\":0.85}]}}",
-  "target_pid": "<UUID 格式的 PID>",
+  "memory_json": "{\"l3\":{\"persona\":[{\"type\":\"preference\",\"summary\":\"New preference\",\"state\":\"active\",\"importance\":0.85}]}}",
+  "target_pid": "<UUID-format PID>",
   "target_collection": "memory_persona",
   "target_layer": "L3",
   "confirm": true
 }
 ```
 
-**两阶段模式**：
+**Two-phase mode**:
 
 ```json
-// 第一阶段：召回 + 生成 token
+// Phase 1: recall + generate token
 { "query": "...", "memory_json": "...", "confirm": false }
-// → 返回 { phase:"confirm", token:"...", target:{pid,layer,summary}, candidates:[...] }
+// → returns { phase:"confirm", token:"...", target:{pid,layer,summary}, candidates:[...] }
 
-// 第二阶段：带 token 真更新
+// Phase 2: update with token
 { "query": "...", "confirm": true, "token": "***" }
 ```
 
 ---
 
-### `memory_os_delete` — 删除记忆
+### `memory_os_delete` — Delete Memories
 
-**快捷模式（推荐，一次性直接删）**：
+**Shortcut mode (recommended, direct delete)**:
 
 ```json
 {
-  "target_pid": "<UUID 格式的 PID>",
+  "target_pid": "<UUID-format PID>",
   "target_collection": "memory_persona",
   "target_layer": "L3",
   "confirm": true
 }
-// → 返回 { deleted: {l0:0, l1:0, l2:0, l3:1} }
+// → returns { deleted: {l0:0, l1:0, l2:0, l3:1} }
 ```
 
-**两阶段模式**：
+**Two-phase mode**:
 
 ```json
-// 第一阶段：召回候选 + 生成 token
+// Phase 1: recall candidates + generate token
 { "query": "...", "layer": "L3", "confirm": false }
-// → 返回 { phase:"confirm", token:"...", candidates:[...] }
+// → returns { phase:"confirm", token:"...", candidates:[...] }
 
-// 第二阶段：带 token 真删
+// Phase 2: delete with token
 { "query": "...", "confirm": true, "token": "***", "selected_pids": ["pid1"] }
 ```
 
-**PID 和 Collection 速查**：
+**PID and Collection Quick Ref**:
 
-| 层 | Collection | PID 来源 |
-|----|-----------|---------|
-| L0 | `memory_l0` | 召回返回的 `_qdrant_pid` |
-| L1 | 8 个原有 collection | 召回返回的 `_qdrant_pid` |
-| L2 | `memory_scenario` | 召回返回的 `pid`（UUID 格式）|
-| L3 | `memory_persona` | 召回返回的 `pid`（UUID 格式）|
+| Layer | Collection | PID Source |
+|-------|-----------|-----------|
+| L0 | `memory_l0` | `_qdrant_pid` from recall |
+| L1 | 8 collections | `_qdrant_pid` from recall |
+| L2 | `memory_scenario` | `pid` from recall (UUID) |
+| L3 | `memory_persona` | `pid` from recall (UUID) |
 
-**Token TTL：30 分钟**，存在 `~/.openclaw/workspace/memory-os/tokens/`
-
----
-
-## 自动 Hook 注入
-
-插件通过 OpenClaw Hook **自动**工作，无需 Agent 显式调用：
-
-- `before_prompt_build`：每次 LLM 调用前，对用户输入走召回流程，符合条件时自动注入记忆
-- `message_received`：消息接收时触发
-
-**Hook 门控规则**：
-
-| 规则 | 行为 |
-|------|------|
-| 字数 < 5 字 | 跳过 |
-| 字数 > 300 字 | 截句拆送 |
-| 纯情绪词（嗯/啊/好的/OK） | 跳过 |
-| 含粗口 | 跳过 |
+**Token TTL: 30 minutes**, stored in `~/.openclaw/workspace/memory-os/tokens/`
 
 ---
 
-## 抽取规范
+## Auto Hook Injection
 
-LLM 按 `scripts/extract_prompt.md` 的规范抽取 4 层记忆。
+Plugin works automatically via OpenClaw Hook — no explicit Agent calls needed:
 
-**核心原则**：
+- `before_prompt_build`: Recall on every LLM call, inject if conditions met
+- `message_received`: Triggers on message receipt
 
-- **L0**：原文保存，不推理
-- **L1**：最小独立知识单元，可脱离原 Context 独立理解
-- **L2**：多个 L1 组成的完整场景，有标题和摘要
-- **L3**：跨场景长期稳定的认知，**宁缺勿编**
+**Hook Gate Rules**:
 
----
-
-## 调参指南
-
-所有参数集中在 `scripts/recall_config.py`。
-
-### 召回质量
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `MEMORY_OS_RECALL_DEFAULT_TOP_K` | 8 | 融合后保留条数 |
-| `MEMORY_OS_VEC_MIN_SCORE` | 0.60 | 向量召回最低相似度 |
-| `MEMORY_OS_GRAPH_DEPTH` | 1 | 图召回跳数 |
-| `MEMORY_OS_RRF_K` | 60 | RRF 融合参数 |
-
-### Association Expansion（2026-09-01）
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `ASSOC_ENABLED` | 1 | 开关，0=关闭 |
-| `ASSOC_MAX_HOPS` | 2 | Neo4j 最大扩散跳数 |
-| `ASSOC_MAX_NEIGHBORS` | 6 | 每跳最多扩展邻居数 |
-| `ASSOC_ACTIVATION_THRESHOLD` | 0.1 | 联想激活阈值 |
-| `ASSOC_DEPTH_DECAY` | 0.5 | hop 深度衰减系数 |
-| `ASSOC_MAX_CANDIDATES` | 20 | 最多联想候选数 |
-
-### Hook 门控
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `HOOK_MIN_LEN` | 5 | 触发召回的最短字数 |
-| `HOOK_MAX_LEN` | 300 | 单段触发上限 |
+| Rule | Behavior |
+|------|----------|
+| Text < 5 chars | Skip |
+| Text > 300 chars | Split by sentence |
+| Pure emotion words (嗯/啊/好的/OK) | Skip |
+| Contains profanity | Skip |
 
 ---
 
-## 运维命令
+## Extraction Spec
+
+LLM extracts 4-layer memories per `scripts/extract_prompt.md`.
+
+**Core principles**:
+
+- **L0**: Raw text preserved, no reasoning
+- **L1**: Minimum independent knowledge unit, understandable without original context
+- **L2**: Complete scenario from multiple L1s, with title and summary
+- **L3**: Cross-scenario stable cognition, **prefer to omit rather than fabricate**
+
+---
+
+## Tuning Guide
+
+All parameters centralized in `scripts/recall_config.py`.
+
+### Recall Quality
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `MEMORY_OS_RECALL_DEFAULT_TOP_K` | 8 | Final retained count after fusion |
+| `MEMORY_OS_VEC_MIN_SCORE` | 0.60 | Vector recall min similarity |
+| `MEMORY_OS_GRAPH_DEPTH` | 1 | Graph recall hop count |
+| `MEMORY_OS_RRF_K` | 60 | RRF fusion parameter |
+
+### Association Expansion (2026-09-01)
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `ASSOC_ENABLED` | 1 | Toggle, 0=off |
+| `ASSOC_MAX_HOPS` | 2 | Neo4j max expansion hops |
+| `ASSOC_MAX_NEIGHBORS` | 6 | Max neighbors per hop |
+| `ASSOC_ACTIVATION_THRESHOLD` | 0.1 | Association activation threshold |
+| `ASSOC_DEPTH_DECAY` | 0.5 | Hop depth decay factor |
+| `ASSOC_MAX_CANDIDATES` | 20 | Max association candidates |
+
+### Hook Gate
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `HOOK_MIN_LEN` | 5 | Min text length to trigger recall |
+| `HOOK_MAX_LEN` | 300 | Per-segment trigger cap |
+
+---
+
+## Operations Commands
 
 ```bash
-# 启动所有服务
+# Start all services
 python3 scripts/service_lifecycle.py start-all
 
-# 查看服务状态
+# Check service status
 python3 scripts/service_lifecycle.py status
 
-# 停止所有服务
+# Stop all services
 python3 scripts/service_lifecycle.py stop-all
 
-# 召回统计
+# Recall statistics
 python3 scripts/recall_stats.py
 
-# 开启召回调试
+# Enable recall debug
 MEMORY_OS_RECALL_DEBUG=1 python3 scripts/recall_4layer.py recall --query "..."
 
-# 查看 Hook 追踪日志
+# View hook trace log
 cat ~/.openclaw/workspace/memory-os/logs/hook-trace.md
 ```
 
 ---
 
-## 文档索引
+## Documentation Index
 
-| 文档 | 内容 |
-|------|------|
-| `README.md` | 总览、安装、工具 API、运维 |
-| `README_recall.md` | 召回流程详解（6 Step + Association） |
-| `MEMORY-OS-4LAYER.md` | 4 层架构详解、数据结构、设计决策 |
+| Doc | Content |
+|-----|---------|
+| `README.md` | Overview, install, tool API, ops |
+| `README_recall.md` | Recall flow detail (6 Steps + Association) |
+| `MEMORY-OS-4LAYER.md` | 4-layer architecture, data structures, design decisions |
 
 ---
 
