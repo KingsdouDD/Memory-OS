@@ -114,6 +114,8 @@ memory-os/                 # ← 本地运行时数据（独立目录）
 | **Reranker Daemon** | 8877 | `launchctl kickstart gui/501/com.memoryos.reranker` |
 
 > 插件启动时会自动检测服务状态，未启动时自动拉起。
+>
+> **自检报告**：插件每次启动时自动跑 11 项质检（Python环境/包/脚本/模型/Token目录/4个服务端口/Neo4j认证/Qdrant API），FAIL 项打印修复命令，WARN 项提醒，全部通过则 ✅ 通过。
 
 ### Embedding 模型
 
@@ -141,11 +143,48 @@ MEMORY_OS_EMBEDDING_MODEL=~/.openclaw/workspace/memory-os/models/bge-m3-Q8_0.ggu
 MEMORY_OS_HOOK_TRACE_ENABLED=1
 ```
 
-### 2. 启动服务
+### 2. 启动服务（可选手动，插件会自动拉起）
 
 ```bash
 python3 scripts/service_lifecycle.py start-all
 python3 scripts/service_lifecycle.py status
+```
+
+> **提示**：插件启动时会自动检测并拉起未运行的服务，手动启动仅在需要时使用。
+
+### 3. 插件自检（自动执行）
+
+插件每次加载时自动跑 11 项质检，无需手动触发。自检内容包括：
+
+| 检查项 | 说明 |
+|--------|------|
+| Python 环境 + 版本 | Python 可执行文件是否可用 |
+| `neo4j` / `qdrant_client` / `jieba` 包 | 是否安装及版本 |
+| 关键脚本文件 | `write_4layer.py` / `recall_4layer.py` / `process_dream.py` |
+| Embedding 模型文件 | GGUF 文件是否存在 |
+| Token 目录可写性 | `~/.openclaw/workspace/memory-os/tokens/` |
+| 4 个服务端口 | Neo4j / Qdrant / Embed Daemon / Reranker Daemon |
+| Neo4j bolt 认证 | 用户名密码连通性 |
+| Qdrant REST API | `GET /readyz` HTTP 200 |
+
+FAIL 项示例输出（打印修复命令）：
+
+```
+🍊 Memory OS 自检报告
+  ✅ Python 环境          3.11.0
+  ✅   包: neo4j         5.x.x
+  ✅   包: qdrant_client   ok
+  ✅   包: jieba           ok
+  ✅   脚本: write_4layer.py   存在
+  ✅   Embedding 模型     bge-m3-Q8_0.gguf
+  ✅   Token 目录         可写
+  ❌  Neo4j 服务          端口 7687 未监听
+                              请运行: brew services start neo4j
+  ✅  Qdrant 服务          端口 6333 在线
+  ✅  Embed Daemon        端口 8765 在线
+  ✅  Reranker Daemon     端口 8877 在线
+══════════════════════════════════════════════
+  ❌  共 1 项不合格，请修复后再使用
 ```
 
 ---
