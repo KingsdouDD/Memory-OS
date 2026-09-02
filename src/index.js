@@ -689,27 +689,12 @@ export default definePluginEntry({
         const topK = Number(params.top_k || 5);
         const layer = params.layer || null;
         const confirm = params.confirm === true;
-        const hasDirect = params.target_pid && params.target_collection && params.target_layer;
-
-        // 快捷模式：三个参数都传了 → 一次性直接删（不走两阶段、不需要 token）
-        if (hasDirect && !confirm) {
-          const args = ["delete",
-            "--direct-pid", String(params.target_pid),
-            "--direct-collection", String(params.target_collection),
-            "--direct-layer", String(params.target_layer)];
-          const res = await runPython(
-            args,
-            { env: buildEnv(config), script: path.resolve(__dirname, "../scripts/write_4layer.py") }
-          );
-          const last = res.stdout.trim().split(/\n/).filter(Boolean).pop() || "{}";
-          let payload;
-          try { payload = JSON.parse(last); } catch { payload = { raw: { error: "返回解析失败", stdout_tail: res.stdout.slice(-300) } }; }
-          return { content: [{ type: "text", text: JSON.stringify(payload) }] };
-        }
 
         // 第二阶段：真删
         if (confirm) {
           const args = ["confirm", "--token", String(params.token || "")];
+          // 快捷模式：直接传 pid + collection + layer，跳过 token
+          const hasDirect = params.target_pid && params.target_collection && params.target_layer;
           if (hasDirect) {
             args.splice(0, args.length, "delete",
               "--direct-pid", String(params.target_pid),
@@ -751,24 +736,19 @@ export default definePluginEntry({
     // 第二阶段：传 query + confirm=true + token，真更新（覆盖）
     api.registerTool({
       name: "memory_os_update",
-      description: "更新 Memory OS 4 层记忆。两阶段：\n- confirm=false（默认）：召回候选 + 返回 token\n- confirm=true：带 token 真更新\n快捷模式：传 target_pid + target_collection + target_layer + confirm=true，直接更新（跳过 token）\n**推荐用 `memory_json` 参数**传 4 层 JSON 字符串（避免 MCP 嵌套数组被展平）。也可以用 `memory` 对象参数（不推荐）。兼容老格式：传 `kos: [...]` L1 数组。",
+      description: "更新 Memory OS 4 层记忆。两阶段：\n- confirm=false（默认）：召回候选 + 返回 token\n- confirm=true：带 token 真更新\n新内容用 4 层结构（l0/l1/l2/l3），工具自动按目标层分发写入。",
       parameters: {
         type: "object",
         properties: {
-          memory_json: {
-            type: "string",
-            description: "【推荐】4 层结构的 JSON 字符串，避免 MCP 嵌套数组被展平。例：'{\"l1\":{\"kos\":[{\"summary\":\"...\",\"entities\":[...]}]}}'",
-          },
           query: { type: "string", description: "召回目标记忆的 query" },
           memory: {
             type: "object",
             description: "新内容（4 层结构 {l0, l1, l2, l3}）",
             properties: {
               l0: { type: "object" },
-              l1: { type: "object", properties: { kos: { type: "array", description: "L1 原子记忆 KO 数组", items: { type: "object", properties: { type: { type: "string" }, summary: { type: "string", description: "≤150字" }, state: { type: "string" }, entities: { type: "array", description: "实体列表（平铺，不要嵌套）", items: { type: "object", properties: { name: { type: "string" }, label: { type: "string" } }, required: ["name", "label"] } }, relations: { type: "array", items: { type: "object" } } } } } } },
-              l2: { type: "object", properties: { scenario: { type: ["object", "null"], properties: { title: { type: "string" }, summary: { type: "string" }, type: { type: "string" }, state: { type: "string" }, entities: { type: "array", description: "实体列表（平铺）", items: { type: "object", properties: { name: { type: "string" }, label: { type: "string" } }, required: ["name", "label"] } } } } } },
-              l3: { type: "object", properties: { persona: { type: "array", description: "L3 persona 数组，每个元素是一条画像记忆", items: { type: "object", properties: { type: { type: "string", description: "类型，如 fact/preference/routine" }, summary: { type: "string", description: "画像内容，≤150字" }, state: { type: "string", enum: ["active", "historical", "ongoing", "uncertain"] }, importance: { type: "number", minimum: 0, maximum: 1 }, entities: { type: "array", description: "实体列表（平铺，不要嵌套）", items: { type: "object", properties: { name: { type: "string" }, label: { type: "string", enum: ["Person", "Place", "Animal", "Concept", "Object"] } }, required: ["name", "label"] } } } } } },
-
+              l1: { type: "object" },
+              l2: { type: "object" },
+              l3: { type: "object" },
             },
           },
           kos: {
@@ -783,11 +763,7 @@ export default definePluginEntry({
           target_collection: { type: "string", description: "target_pid 所在的 collection 名" },
           target_layer: { type: "string", enum: ["L0","L1","L2","L3"], description: "target_pid 的层" },
         },
-        anyOf: [
-          { required: ["query"] },
-          { required: ["token"] },
-          { required: ["target_pid"] },
-        ],
+        required: ["query"],
       },
       async execute(_id, params) {
         const topK = Number(params.top_k || 5);
@@ -795,15 +771,9 @@ export default definePluginEntry({
 
         // 第二阶段：真更新
         if (confirm) {
-          // 构造新内容（必传）。优先用 memory_json 字符串，避免 MCP 嵌套数组被展平。
+          // 构造新内容（必传）
           let payload4;
-          if (params.memory_json && typeof params.memory_json === "string") {
-            try {
-              payload4 = JSON.parse(params.memory_json);
-            } catch (e) {
-              return { content: [{ type: "text", text: JSON.stringify({ error: "memory_json 解析失败: " + e.message }) }] };
-            }
-          } else if (params.memory && typeof params.memory === "object") {
+          if (params.memory && typeof params.memory === "object") {
             payload4 = params.memory;
           } else if (Array.isArray(params.kos) && params.kos.length > 0) {
             payload4 = { l1: { kos: params.kos } };
@@ -863,7 +833,7 @@ export default definePluginEntry({
         } finally {
           try { fs.unlinkSync(tmpFile); } catch {}
         }
-      }},
+      },
     });
 
   },

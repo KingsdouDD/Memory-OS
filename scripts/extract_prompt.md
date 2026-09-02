@@ -472,13 +472,7 @@ L3 Tags：
 {
   "l0": {
     "scene_summary": "当前 Scene 的简短摘要",
-    "source": "dream:light:YYYY-MM-DD",
-    "entities": [
-      {
-        "name": "实体名称",
-        "label": "Person|Place|Organization|Object|Animal|Concept"
-      }
-    ]
+    "source": "dream:light:YYYY-MM-DD"
   },
 
   "l1": {
@@ -560,13 +554,7 @@ L3 Tags：
         "type": "fact|preference|routine|goal|relationship|belief|experience",
         "summary": "稳定的长期认知，≤150字",
         "state": "active|historical|ongoing|uncertain",
-        "importance": 0.0,
-        "entities": [
-          {
-            "name": "实体名称",
-            "label": "Person|Place|Organization|Object|Animal|Concept"
-          }
-        ]
+        "importance": 0.0
       }
     ]
   }

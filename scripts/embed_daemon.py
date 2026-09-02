@@ -38,7 +38,6 @@ PROMPT_PREFIX = "Represent this sentence for searching: "
 _shared_last_active = [time.time()]
 
 
-# ── 模型封装 ────────────────────────────────────────────────────────────────
 class MLXEmbeddingModel:
     """BGE-M3 MLX 版本（mlx_embeddings）"""
 
@@ -57,34 +56,12 @@ class MLXEmbeddingModel:
 
         prompt = PROMPT_PREFIX + text
         tokens = self.tokenizer.encode(prompt)
-
-        try:
-            input_ids = mx.array([tokens])
-            output = self.model(input_ids)
-            embedding = output.last_hidden_state.mean(axis=1)
-
-            # 确保计算图求值完成，再读取结果
-            mx.eval(embedding)
-            result = embedding[0].tolist()
-
-            # 立即释放本次请求的临时 Tensor，不再引用
-            del embedding
-            del output
-            del input_ids
-
-            mx.clear_cache()
-            return result
-
-        except Exception:
-            # 异常路径：清理所有临时对象
-            for _var in ["input_ids", "output", "embedding"]:
-                try:
-                    if _var in dir():
-                        exec(f"del {_var}")
-                except Exception:
-                    pass
-            mx.clear_cache()
-            raise
+        input_ids = mx.array([tokens])
+        output = self.model(input_ids)
+        embedding = output.last_hidden_state.mean(axis=1)
+        result = embedding[0].tolist()
+        mx.clear_cache()
+        return result
 
     def encode_batch(self, texts: list) -> list:
         return [self.encode(text) for text in texts]
@@ -100,7 +77,6 @@ class MLXEmbeddingModel:
         LOG.info("model unloaded, cache cleared")
 
 
-# ── HTTP Handler ────────────────────────────────────────────────────────────
 class EmbedHandler(BaseHTTPRequestHandler):
     service: MLXEmbeddingModel = None
     model_path: str = None

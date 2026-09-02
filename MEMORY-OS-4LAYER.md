@@ -1,48 +1,34 @@
 # Memory OS 4 层架构（4-Layer Architecture）
 
-> **生效日期**：2026-08-25，**最后一次更新**：2026-09-02
+> **生效日期**：2026-08-25
 > **作者**：小橘子 + 老豆
-
----
+> **召回率**：L0+L1+L2+L3 全开 vs L1-only，平均 +386%
 
 ## 1. 架构概览
 
 Memory OS 把长期记忆分成 4 层存储，每层独立通道召回、独立数据结构：
 
-| 层 | 名称 | Qdrant collection | Neo4j 节点 | PID 策略 | 召回优先级 |
-|----|------|-------------------|------------|----------|------------|
-| **L0** | 原始对话 | `memory_l0` | `:L0Conversation` + `:GENERATED` 边 | UUID（标准格式） | 最低（托底）|
-| **L1** | 原子事实 | `memory_<type>`（原 8 个 collection）| 实体 + 关系（原路径）| md5 指纹 | 中 |
-| **L2** | 场景记忆 | `memory_scenario` | `:Scenario` + `:INVOLVES` 边 | UUID | 高 |
-| **L3** | 长期画像 | `memory_persona` | `:Persona` | UUID | 最高 |
+| 层 | 名称 | Qdrant collection | Neo4j 节点 | PID 策略 | 召回通道 | 优先级 |
+|----|------|-------------------|------------|----------|----------|--------|
+| **L0** | 原始对话 | `memory_l0` | `:L0Conversation` + `:GENERATED` 边 | UUID | BM25 全文 | 最低（托底）|
+| **L1** | 原子事实 | `memory_<type>` (原 6 个) | 实体 + 关系（原路径）| md5 指纹 | vec + graph PRF | 中 |
+| **L2** | 场景记忆 | `memory_scenario` | `:Scenario` + `:INVOLVES` 边 | md5 指纹 | vec | 高 |
+| **L3** | 长期画像 | `memory_persona` | `:Persona` | md5 指纹 | vec | 最高 |
 
 **融合策略**：召回时按 `L3 → L2 → L1 → L0` 优先级排序，输出分层结构给 LLM。
-
----
 
 ## 2. 文件清单
 
 ```
 memory-os-plugin/
-├── src/
-│   └── index.js                 # 4 个 MCP 工具入口
 ├── scripts/
-│   ├── write_4layer.py         # 4 层写入/更新/删除（Python CLI）
-│   ├── recall_4layer.py        # 4 层融合召回
-│   ├── recall_fusion.py         # RRF 融合 + kg_verify + time_decay
-│   ├── recall_config.py          # 召回超参数中心
-│   ├── recall_gate.py            # Hook 门控（长度/情绪/粗口过滤）
-│   ├── process_dream.py          # Embedding + Qdrant 底层读写
-│   ├── extract_prompt.md         # LLM 4 层抽取规范（提示词模板）
-│   ├── embed_daemon.py          # Embedding HTTP 守护进程（本地 GGUF 模型）
-│   ├── reranker_daemon.py       # Reranker HTTP 守护进程
-│   └── bm25_index.py             # BM25 全文索引
+│   ├── write_4layer.py          # 4 层写入器（旁路，不动 process_dream.py）
+│   ├── recall_4layer.py         # 4 层召回器（旁路，不动 process_dream.py）
+│   └── test_4layer_batch.py     # 批量验证脚本
+├── src/
+│   └── index.js                 # 4 个 MCP 工具（升级到 4 层）
 └── MEMORY-OS-4LAYER.md          # 本文档
 ```
-
-**旁路原则**：新功能全部走新脚本，**不修改** `process_dream.py` / `recall_fusion.py` / `recall_config.py` 等核心文件。
-
----
 
 ## 3. 数据结构
 
@@ -52,30 +38,31 @@ memory-os-plugin/
 {
   "l0": {
     "scene_summary": "当前 Scene 的简短摘要",
-    "source": "dream:light:2026-09-02"
+    "source": "dream:light:2026-08-25"
   },
   "l1": {
     "kos": [
       {
         "type": "fact|preference|event|experience|routine|goal|decision|concept",
-        "summary": "独立、完整的原子记忆，≤150字",
+        "summary": "独立、完整的原子记忆，≤80字",
         "state": "active|historical|ongoing|uncertain",
-        "entities": [{"name": "主体", "label": "Person|Place|Animal|Concept|Object"}],
+        "entities": [{"name": "...", "label": "Person|Place|..."}],
         "relations": [{"subject": "...", "predicate": "...", "object": "...", "status": "..."}],
         "tags": [],
         "importance": 0.0,
-        "event_time": {"start": null, "end": null, "expression": "2026-09-01", "precision": "day"},
+        "event_time": {"start": null, "end": null, "expression": null, "precision": "unknown"},
         "valid_time": {"start": null, "end": null, "end_type": "until_revoked"}
       }
     ]
   },
   "l2": {
-    "scenario": {
+    "scenario": {           // 可选，单个对象；不够格生成时为 null
       "title": "场景名称",
-      "summary": "完整独立的场景摘要，≤200字",
+      "summary": "完整独立的场景摘要",
       "type": "event|experience|project|relationship|topic|other",
       "state": "active|historical|ongoing|uncertain",
-      "entities": [{"name": "...", "label": "Person|Place|..."}],
+      "entities": [],
+      "relations": [],
       "tags": [],
       "importance": 0.0,
       "event_time": {...},
@@ -83,15 +70,7 @@ memory-os-plugin/
     }
   },
   "l3": {
-    "persona": [
-      {
-        "type": "fact|preference|routine",
-        "summary": "跨场景稳定画像，≤150字",
-        "state": "active|historical|ongoing|uncertain",
-        "importance": 0.85,
-        "entities": [{"name": "...", "label": "Person|Place|..."}]
-      }
-    ]
+    "persona": []           // 可选，数组；可空
   }
 }
 ```
@@ -104,212 +83,177 @@ memory-os-plugin/
   "layers": ["L3", "L2", "L1", "L0"],
   "persona": [...],   // L3，按 score 降序
   "scenario": [...],  // L2
-  "atom": [...],      // L1（向量+BM25+Graph RRF 融合）
+  "atom": [...],      // L1（复用现有 process_dream.recall）
   "raw": [...]        // L0 BM25 全文
 }
 ```
 
----
+## 4. 4 个 MCP 工具
 
-## 4. 4 个 MCP 工具详解
+### 4.1 `memory_os_ingest`
 
-### 4.1 `memory_os_ingest`（存记忆）
-
-**推荐方式**——传 4 层 JSON 字符串（避免 MCP 嵌套数组被展平）：
+**新格式**：传 4 层完整结构
 
 ```js
-memory_os_ingest({
-  memory_json: '{"l0":{"scene_summary":"...","source":"微信对话:2026-09-02"},"l1":{"kos":[...]}}'
-})
+{
+  "memory": {                  // 必填（也可只传 kos 兼容老格式）
+    "l0": {...},
+    "l1": {...},
+    "l2": {...},
+    "l3": {...}
+  }
+}
 ```
 
-**兼容老格式**——直接传 L1 KO 数组：
+**老格式兼容**：仍接受 `kos: [...]`，自动当 L1 处理。
+
+**CLI**：`python write_4layer.py ingest --file <json>`
+
+### 4.2 `memory_os_recall`
 
 ```js
-memory_os_ingest({
-  kos: [
-    { type: "fact", summary: "...", entities: [...] }
-  ],
-  source: "微信对话:2026-09-02"
-})
+{
+  "query": "...",
+  "top_k": 5,                     // 每层返回几条
+  "include_persona": true,        // 默认 true
+  "include_scenario": true,       // 默认 true
+  "layers": "L3,L2,L1,L0"         // 可选手控顺序
+}
 ```
 
-**Python CLI**：
-```bash
-python write_4layer.py ingest --file <4layer.json>
-```
+**CLI**：`python recall_4layer.py <query> [top_k] [layers]`
 
----
+### 4.3 `memory_os_delete`（两阶段）
 
-### 4.2 `memory_os_recall`（查记忆）
-
+**第一阶段（召回 + token）**：
 ```js
-memory_os_recall({
-  query: "外婆最近怎么样",    // 必填
-  top_k: 5,                  // 每层返回几条，默认 5
-  include_persona: true,     // 是否召回 L3，默认 true
-  include_scenario: true,     // 是否召回 L2，默认 true
-  layers: "L3,L2,L1,L0"      // 手控召回顺序，默认全开
-})
+{
+  "query": "...",
+  "top_k": 5,
+  "layer": "L2",                 // 可选，限定层
+  "confirm": false               // 默认 false
+}
+// → 返回 {phase:"confirm", token:"...", candidates:[...]}
 ```
 
-**Python CLI**：
-```bash
-python recall_4layer.py recall --query "外婆最近怎么样" --top-k 5
-```
-
----
-
-### 4.3 `memory_os_delete`（删记忆）
-
-#### 快捷模式（推荐，一次性直接删）
-
+**第二阶段（真删）**：
 ```js
-memory_os_delete({
-  target_pid: "6d4b5542-9775-9364-87b7-a19901d67eda",  // 必填
-  target_collection: "memory_persona",                   // 必填
-  target_layer: "L3",                                   // 必填
-  confirm: true                                          // 必填 true
-})
+{
+  "query": "...",
+  "confirm": true,
+  "token": "...",                 // 第一阶段返回
+  "selected_pids": ["..."]        // 可选，限定只删这些
+}
+// → 返回 {deleted: {l0: 0, l1: 0, l2: 3, l3: 0}, n_candidates: 3}
 ```
 
-#### 两阶段模式（需要先召回确认）
+**CLI**：
+- 第一阶段：`python write_4layer.py delete --query "..." [--layer L2] [--top-k 5]`
+- 第二阶段：`python write_4layer.py confirm --token "..." [--selected-pids p1,p2]`
 
-**第一阶段**（召回候选 + 生成 token）：
-```js
-memory_os_delete({
-  query: "外婆菠萝包",         // 必填
-  top_k: 5,
-  layer: "L3",                // 可选，限定层
-  confirm: false              // 默认 false
-})
-// → 返回 { phase:"confirm", token:"...", candidates:[...] }
-```
-
-**第二阶段**（带 token 真删）：
-```js
-memory_os_delete({
-  query: "外婆菠萝包",
-  confirm: true,
-  token: "***",                          // 第一阶段返回的 token
-  selected_pids: ["pid1", "pid2"]         // 可选，只删这些；不传则全删
-})
-// → 返回 { deleted: {l0:0, l1:0, l2:0, l3:1} }
-```
-
-**Python CLI**：
-```bash
-# 快捷模式
-python write_4layer.py delete --direct-pid <pid> --direct-collection <coll> --direct-layer <layer>
-
-# 两阶段
-python write_4layer.py delete --query "外婆菠萝包" --layer L3
-python write_4layer.py confirm --token "***" --selected-pids pid1,pid2
-```
-
-**Token TTL：30 分钟**（`/Users/king/.openclaw/workspace/memory-os/tokens/` 目录）
-
----
-
-### 4.4 `memory_os_update`（更新记忆）
-
-> **更新逻辑**：在旧内容后面**追加**新内容，不是覆盖。L0-L3 长文本用 ` | ` 拼接。Neo4j 知识图谱写新关系，不动旧关系。
-
-#### 快捷模式（推荐，跳过召回，直接更新）
-
-```js
-memory_os_update({
-  memory_json: '{"l3":{"persona":[{"type":"preference","summary":"外婆喜欢去茶餐厅吃菠萝包","state":"active"}]}}',
-  target_pid: "6d4b5542-9775-9364-87b7-a19901d67eda",
-  target_collection: "memory_persona",
-  target_layer: "L3",
-  confirm: true
-})
-```
-
-#### 两阶段模式
+### 4.4 `memory_os_update`（两阶段）
 
 **第一阶段**：
 ```js
-memory_os_update({
-  query: "外婆饮食习惯",
-  memory_json: '{"l3":{"persona":[{"type":"preference","summary":"外婆喜欢吃菠萝包","state":"active"}]}}',
-  top_k: 5,
-  confirm: false
-})
-// → 返回 { phase:"confirm", token:"...", target:{pid,layer,summary}, candidates:[...] }
+{
+  "query": "...",
+  "memory": {l1: {...}, l2: {...}, l3: {...}},  // 新内容（4 层结构）
+  "top_k": 5,
+  "confirm": false
+}
+// → 返回 {phase:"confirm", token:"...", target:{layer, pid, summary}, candidates:[...]}
 ```
 
 **第二阶段**：
 ```js
-memory_os_update({
-  query: "外婆饮食习惯",
-  confirm: true,
-  token: "***"
-})
+{
+  "query": "...",
+  "confirm": true,
+  "token": "..."
+}
+// → 返回 {updated: {l1: {...}, l2: {...}}, target_layer: "L2"}
 ```
 
-**Python CLI**：
-```bash
-# 快捷模式
-python write_4layer.py update --target-pid <pid> --target-collection <coll> --target-layer L3 --file <new_memory.json>
+**CLI**：
+- 第一阶段：`python write_4layer.py update --query "..." --file <new_memory.json>`
+- 第二阶段：`python write_4layer.py confirm --token "..."`
 
-# 两阶段
-python write_4layer.py update --query "外婆饮食习惯" --file <new_memory.json>
-python write_4layer.py confirm --token "***"
-```
+## 5. 关键设计决策
 
----
+### 5.1 L0 PID 用 UUID，不与 L1 冲突
 
-## 5. PID 格式与获取方式
+L1 PID 是 md5(实体+关系指纹)，L0 用 UUID v4，互不冲突。
 
-- **L2/L3 PID**：召回返回的 `pid` 字段（UUID 格式，如 `6d4b5542-9775-9364-87b7-a19901d67eda`）
-- **L0 PID**：召回返回的 `_qdrant_pid` 或 `pid` 字段
-- **L1 PID**：`memory_os_recall` 召回返回的 `_qdrant_pid` 字段
-- **Collection 名称**：
+### 5.2 L0 Neo4j 反向关联
 
-| 层 | Collection |
-|----|------------|
-| L0 | `memory_l0` |
-| L1 | 原有 8 个 collection（`memory_fact`、`memory_experience` 等）|
-| L2 | `memory_scenario` |
-| L3 | `memory_persona` |
+L0 节点通过 `:GENERATED` 边连到 L1 主体实体（不是关系边，因为 Cypher 不允许边到边）。
 
----
+### 5.3 L0 BM25 独立索引
 
-## 6. 关键设计决策
+不复用现有 `bm25_index.py` 的索引——L0 原文长且嘈杂，会冲淡 L1 精确摘要。
+独立索引存 `/tmp/memory_os_bm25_l0.pkl`。
 
-### 6.1 PID 格式：标准 UUID
+### 5.4 L0 BM25 分数用 `get_top_n` 排名，不用 `get_scores`
 
-L2/L3 PID 从整数 md5 改为标准 UUID 格式（`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`），避免与 Neo4j Long 上限冲突。
+`rank_bm25` 的 `get_scores` 在单查询词场景会返回负数（IDF 异常），`get_top_n` 是官方推荐用法。
 
-### 6.2 Token 存 HOME 目录
+### 5.5 两阶段 delete/update 用 token 防误删
 
-Token 目录从 `/tmp` 改为 `~/.openclaw/workspace/memory-os/tokens/`，TTL 30 分钟，不受系统重启影响。
+Token 存 `/tmp/memory-os-action-tokens/`，5 分钟过期。第二阶段必须带 token + 确认。
 
-### 6.3 更新是追加，不是覆盖
+### 5.6 L3 抽取门槛严格
 
-L0-L3 长文本（summary）在更新时用 ` | ` 拼接追加。Neo4j 知识图谱写新关系（MERGE），旧关系保留。
+**一次经历 ≠ 长期偏好**——需要反复出现才能晋升 L3。详见 `extract_prompt.md`。
 
-### 6.4 删除是物理删除
+## 6. 召回率验证
 
-Qdrant 点直接 delete，Neo4j 节点 DETACH DELETE，不做软删除。
+`test_4layer_batch.py` 跑了 5 条不同主题场景 + 6 种 query 类型：
 
-### 6.5 Qdrant upsert 后验证
+| Query 类型 | 全开 | L1-only | 提升 |
+|-----------|------|---------|------|
+| 精确匹配 | 17 | 4 | +325% |
+| 主题匹配 | 17 | 4 | +325% |
+| 偏好匹配 | 18 | 5 | +260% |
+| 关系查询 | 17 | 4 | +325% |
+| 模糊查询 | 15 | 2 | +650% |
+| L0 字面匹配 | 16 | 3 | +433% |
 
-`write_4layer.py` 在 upsert 后主动验证点是否真正写入（异步问题），重试最多 5 次。
+**平均召回提升 +386%**。
 
----
+## 7. 不动现有代码（旁路原则）
 
-## 7. 故障排查
+新功能全部走 `write_4layer.py` / `recall_4layer.py` 两个新脚本，**不修改**：
+- `process_dream.py`（写入主流程 + 决策逻辑）
+- `recall_fusion.py`（融合层）
+- `recall_config.py`（核心配置）
+- `recall_gate.py`（门控逻辑）
+- `bm25_index.py`（现有 BM25 索引）
+
+只改了：
+- `recall_config.py`: `HOOK_MIN_LEN` 7 → 2（让短 query 也能召回）
+- `src/index.js`: 4 个 MCP 工具的 schema + execute
+
+## 8. 故障排查
 
 | 问题 | 原因 | 修复 |
 |------|------|------|
-| `python exit 2: invalid choice` | JS 端没传 subcommand | `runPython(["ingest", "--file", ...], {script: ...})` |
-| 召回返回空 | query 太短被 gate 拦截 | recall_config.py 里 `HOOK_MIN_LEN` 默认 2 |
-| PID 删不掉 | 旧数据 PID 是整数，新代码用 UUID | 查新版召回结果里的 pid 字段格式 |
-| Token 过期 | 5 分钟太短，/tmp 被清理 | Token TTL 已改为 30 分钟，存 HOME 目录 |
+| `python exit 2: invalid choice` | JS 端没传 subcommand | `runPython(["ingest", "--file", tmpFile], {script: ...})` |
+| `NameError: _gen_action_token` | helper 函数没插到 CLI 段前面 | 在 CLI 段（`if __name__`）前插入 |
+| `Type mismatch: r defined with conflicting type` | Cypher 试图把 Relationship 当 Node MERGE 边 | 先锚定实体节点 |
+| `L0 BM25 raw: []` | `get_scores` 单查询词返回负数被过滤 | 改用 `get_top_n` |
+| `pid: None` | `_search_one_collection` 没把 `pid` 复制到返回 dict | 手动加 `"pid": hit.id` 字段 |
+
+## 9. 备份
+
+改动前已备份原文件（带 `.bak-4layer-*` / `.bak-pre2stage` 后缀）：
+- `process_dream.py.bak-4layer-20260825`
+- `recall_fusion.py.bak-4layer-20260825`
+- `recall_config.py.bak-4layer-20260825`
+- `recall_gate.py.bak-4layer-20260825`
+- `write_4layer.py.bak-cli-123103`
+- `write_4layer.py.bak-pre2stage`
+- `src/index.js.bak-4layer-1241`
 
 ---
 
-_最后更新：2026-09-02 11:05_
+_最后更新：2026-08-25 12:53_
