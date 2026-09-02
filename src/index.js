@@ -90,7 +90,7 @@ async function ensureServicesRunning() {
   for (const [name, port] of Object.entries(SERVICE_PORTS)) {
     up[name] = await checkService(name, port);
   }
-  console.log(`[memory-os] ensureServicesRunning: neo4j=${up.neo4j} qdrant=${up.qdrant} embed=${up.embed}`);
+  console.log(`[memory-os] ensureServicesRunning: neo4j=${up.neo4j} qdrant=${up.qdrant} embed=${up.embed} reranker=${up.reranker}`);
 
   for (const [name, port] of Object.entries(SERVICE_PORTS)) {
     if (up[name]) continue; // 已在线，跳过
@@ -98,40 +98,107 @@ async function ensureServicesRunning() {
     console.log(`[memory-os] 尝试拉起 ${name} (端口 ${port})...`);
 
     // 启动命令各服务不同
-    // 注意：launchctl bootstrap/load 会有 I/O error，用 brew services start 代替
-    let cmd, args, waitPort;
+    // 2026-09-02 修复：原来是 fire-and-forget，launchd 拉不起进程时没法发现。
+    // 改成：kickstart + 等端口就绪；30s 超时则自己 spawn python fallback。
+    let cmd, args, fallback;
     if (name === "neo4j") {
       cmd  = "brew";
       args = ["services", "start", "neo4j"];
-      waitPort = port;
     } else if (name === "qdrant") {
       cmd  = "brew";
       args = ["services", "start", "qdrant"];
-      waitPort = port;
     } else if (name === "embed") {
       cmd  = "launchctl";
       args = ["kickstart", `gui/501/com.memoryos.embed-daemon`];
-      waitPort = port;
+      // fallback: 直接 spawn python 跑 daemon（launchd 拉不起时的兜底）
+      fallback = {
+        cmd: process.env.HOME + "/.openclaw/workspace/venv/bin/python3",
+        args: [
+          process.env.HOME + "/.openclaw/workspace/memory-os-plugin/scripts/embed_daemon.py",
+          "--host", "127.0.0.1", "--port", "8765",
+          "--model", (process.env.HOME + "/.openclaw/workspace/memory-os/models/bge-m3-mlx-8bit"),
+          "--idle-timeout", "180",
+        ],
+      };
     } else if (name === "reranker") {
       cmd  = "launchctl";
       args = ["kickstart", `gui/501/com.memoryos.reranker`];
-      waitPort = port;
+      fallback = {
+        cmd: process.env.HOME + "/.openclaw/workspace/venv/bin/python3",
+        args: [
+          process.env.HOME + "/.openclaw/workspace/memory-os-plugin/scripts/reranker_daemon.py",
+          "--host", "127.0.0.1", "--port", "8877",
+          "--model", (process.env.HOME + "/.openclaw/workspace/memory-os/models/Qwen3-Reranker-0.6B-4bit"),
+          "--unload-after", "180",
+        ],
+      };
     }
 
-    try {
-      const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
-      let err = "";
-      child.stderr.on("data", (d) => (err += d.toString()));
-      child.on("close", (code) => {
-        console.log(`[memory-os] ${name} ${cmd}: code=${code} err=${err.slice(0, 200)}`);
-      });
-      child.on("error", (e) => console.log(`[memory-os] ${name} spawn error: ${e}`));
-    } catch (e) {
-      console.log(`[memory-os] ${name} spawn error: ${e}`);
+    // 1. 先尝试 launchctl kickstart（如果有 fallback 配置）
+    let kickstartOk = false;
+    if (cmd) {
+      try {
+        const code = await new Promise((resolve) => {
+          const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+          let err = "";
+          child.stderr.on("data", (d) => (err += d.toString()));
+          child.on("close", (code) => {
+            console.log(`[memory-os] ${name} ${cmd}: code=${code} err=${err.slice(0, 200)}`);
+            resolve(code);
+          });
+          child.on("error", (e) => {
+            console.log(`[memory-os] ${name} spawn error: ${e}`);
+            resolve(-1);
+          });
+        });
+        // kickstart exit 0 或服务本来就没在跑都算 OK
+        kickstartOk = (code === 0);
+      } catch (e) {
+        console.log(`[memory-os] ${name} kickstart exception: ${e}`);
+      }
     }
 
-    // 不等端口就绪：启动命令 fire-and-forget，launchd KeepAlive 会自己保持进程活着
-    // 端口冲突在下次实际调 Python 时会被发现并报错
+    // 2. 等端口就绪（最多 30s）
+    const ready = await waitForPort(port, 30000);
+    if (ready) {
+      console.log(`[memory-os] ${name} (端口 ${port}) 已就绪`);
+      logEvent("service_started", { service: name, port, method: "kickstart", success: true });
+      continue;
+    }
+
+    // 3. 端口还没起来：kickstart 没用 / launchd 没拉起进程 -> 走 fallback
+    console.log(`[memory-os] ${name} kickstart 后端口 ${port} 仍未就绪，尝试 fallback 直接 spawn python`);
+    if (fallback) {
+      try {
+        const fbChild = spawn(fallback.cmd, fallback.args, {
+          stdio: ["ignore", "pipe", "pipe"],
+          detached: true,  // 让进程脱离父进程，自己活下去
+        });
+        fbChild.unref();
+        let fbErr = "";
+        fbChild.stderr.on("data", (d) => (fbErr += d.toString()));
+        fbChild.on("error", (e) => console.log(`[memory-os] ${name} fallback spawn error: ${e}`));
+        fbChild.on("close", (code) => {
+          console.log(`[memory-os] ${name} fallback exited code=${code} err=${fbErr.slice(0, 200)}`);
+        });
+      } catch (e) {
+        console.log(`[memory-os] ${name} fallback spawn exception: ${e}`);
+      }
+
+      // 等 fallback 拉起端口
+      const fbPortReady = await waitForPort(port, 30000);
+      if (fbPortReady) {
+        console.log(`[memory-os] ${name} fallback 拉起成功 (端口 ${port})`);
+        logEvent("service_started", { service: name, port, method: "fallback_spawn", success: true });
+      } else {
+        console.log(`[memory-os] ${name} fallback 30s 内端口仍未就绪，请检查模型路径/手动启动`);
+        logEvent("service_start_failed", { service: name, port, method: "fallback_spawn" });
+      }
+    } else {
+      // 没有 fallback（比如 neo4j/qdrant 走 brew services）只能记录
+      console.log(`[memory-os] ${name} 30s 内端口仍未就绪，无 fallback 可用，请手动: brew services start ${name}`);
+      logEvent("service_start_failed", { service: name, port, method: "kickstart" });
+    }
   }
 }
 
