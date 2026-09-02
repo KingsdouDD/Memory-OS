@@ -114,9 +114,10 @@ def _now_cn_str():
 
 
 def _gen_pid_layer(text, layer):
-    """L2/L3 独立 PID（前缀带层名，避免与 L1 撞车）。"""
+    """L2/L3 独立 PID（标准 UUID 格式 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx，避 Neo4j Long 上限 + 兼容 Qdrant UUID）。"""
     safe = (text or "").strip()
-    return int(hashlib.md5(f"4layer|{layer}|{safe}".encode()).hexdigest()[:16], 16)
+    h = hashlib.md5(f"4layer|{layer}|{safe}".encode()).hexdigest()
+    return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
 
 def _safe_label(label):
@@ -266,6 +267,39 @@ def _neo4j_driver():
         NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS),
         notifications_min_severity="OFF",
     )
+
+
+def _qdrant_verify_point_written(collection, pid, max_retries=5, sleep_sec=0.3):
+    """Qdrant upsert 后验证点是否真写进去了。
+
+    Bug 修复：Qdrant Python client 1.x 的 upsert 是异步的，调用返回后点不一定已 commit。
+    不验证就报 qdrant_new_ok=True 是假的。
+
+    Args:
+        collection: Qdrant collection 名
+        pid: 要验证的 point id（字符串）
+        max_retries: 最多重试几次
+        sleep_sec: 每次重试间隔
+
+    Returns:
+        True = 点确实在 collection 里
+        False = 验证失败（upsert 可能没持久化）
+    """
+    import time as _time
+    client = _qdrant_client()
+    try:
+        pid_int = int(pid)
+    except (ValueError, TypeError):
+        pid_int = pid
+    for _ in range(max_retries):
+        try:
+            pts = client.retrieve(collection_name=collection, ids=[pid_int])
+            if pts:
+                return True
+        except Exception:
+            pass
+        _time.sleep(sleep_sec)
+    return False
 
 
 def write_l2_scenario(scenario):
@@ -584,8 +618,8 @@ def write_4layer(payload):
 # ============================================================
 from datetime import timedelta as _td
 
-ACTION_TOKEN_DIR = Path("/tmp/memory-os-action-tokens")
-ACTION_TOKEN_TTL_SEC = 300
+ACTION_TOKEN_DIR = Path.home() / ".openclaw" / "workspace" / "memory-os" / "tokens"
+ACTION_TOKEN_TTL_SEC = 1800  # 30 分钟（修复老问题：5 分钟太短 /tmp 会被清理）
 
 
 def _action_token_path(token):
@@ -636,6 +670,45 @@ def _qdrant_delete_point(client, collection, pid):
     except Exception:
         pass
     return False
+
+
+def _neo4j_delete_l0_node(l0_id):
+    """L0Conversation 节点 DETACH DELETE（节点 + 所有出边一起删，实体节点不动）。"""
+    driver = _neo4j_driver()
+    try:
+        with driver.session() as session:
+            session.run(
+                "MATCH (l:L0Conversation {l0_id: $l0_id}) DETACH DELETE l",
+                l0_id=l0_id,
+            )
+    finally:
+        driver.close()
+
+
+def _neo4j_delete_scenario_node(scenario_id):
+    """Scenario 节点 DETACH DELETE。scenario_id 是文本主键，不是数字 PID。"""
+    driver = _neo4j_driver()
+    try:
+        with driver.session() as session:
+            session.run(
+                "MATCH (s:Scenario {scenario_id: $sid}) DETACH DELETE s",
+                sid=scenario_id,
+            )
+    finally:
+        driver.close()
+
+
+def _neo4j_delete_persona_node(pid):
+    """Persona 节点 DETACH DELETE（按 pid 主键）。"""
+    driver = _neo4j_driver()
+    try:
+        with driver.session() as session:
+            session.run(
+                "MATCH (p:Persona {pid: $pid}) DETACH DELETE p",
+                pid=pid,
+            )
+    finally:
+        driver.close()
 
 
 def _neo4j_soft_delete_scenario(scenario_id):
@@ -697,38 +770,41 @@ def _neo4j_soft_delete_l0(l0_id):
 
 
 def confirm_delete_4layer(token, selected_pids=None):
+    """删除工具（重写版）：根据 PID 列表直接删除对应的 L0/L1/L2/L3 记忆。
+    - Neo4j：DETACH DELETE 节点 + 所有相关边（实体节点不动，世界地图保留）
+    - Qdrant：物理删除向量点
+    """
     data = _load_action_token(token)
     if not data or data.get("action") != "delete":
         return {"error": "token 无效或已过期", "deleted": {}}
     candidates = data.get("candidates", [])
     if selected_pids is not None:
-        candidates = [c for c in candidates if c.get("pid") in selected_pids]
+        candidates = [c for c in candidates if str(c.get("pid")) in [str(p) for p in selected_pids]]
     deleted = {"l0": 0, "l1": 0, "l2": 0, "l3": 0}
     try:
         client = _qdrant_client()
         for cand in candidates:
             layer = cand.get("layer")
             pid = cand.get("pid")
+            if not pid:
+                continue
             if layer == "L0":
-                if _qdrant_delete_point(client, L0_COLLECTION, pid):
+                if _qdrant_delete_point(client, L0_COLLECTION, str(pid)):
                     deleted["l0"] += 1
-                _neo4j_soft_delete_l0(pid)
+                _neo4j_delete_l0_node(str(pid))
             elif layer == "L2":
-                if _qdrant_delete_point(client, L2_COLLECTION, pid):
+                if _qdrant_delete_point(client, L2_COLLECTION, str(pid)):
                     deleted["l2"] += 1
-                scenario_id = cand.get("scenario_id") or pid
-                _neo4j_soft_delete_scenario(scenario_id)
+                _neo4j_delete_scenario_node(str(pid))
             elif layer == "L3":
-                if _qdrant_delete_point(client, L3_COLLECTION, pid):
+                if _qdrant_delete_point(client, L3_COLLECTION, str(pid)):
                     deleted["l3"] += 1
-                summary = cand.get("summary") or ""
-                if summary:
-                    _neo4j_soft_delete_persona(summary)
+                _neo4j_delete_persona_node(str(pid))
             elif layer == "L1":
-                pid = cand.get("pid") or cand.get("_qdrant_pid")
+                pid_v = cand.get("pid") or cand.get("_qdrant_pid")
                 coll = cand.get("collection", "memory_fact")
-                if pid:
-                    if _qdrant_delete_point(client, coll, pid):
+                if pid_v:
+                    if _qdrant_delete_point(client, coll, str(pid_v)):
                         deleted["l1"] += 1
     finally:
         try: _action_token_path(token).unlink()
@@ -736,7 +812,400 @@ def confirm_delete_4layer(token, selected_pids=None):
     return {"deleted": deleted, "n_candidates": len(candidates)}
 
 
+def _append_update_l3(persona, target_pid):
+    """L3 更新：旧 Persona 加 valid_time_end + 新 Persona 节点 + ABOUT 边。
+
+    ⚠️ Neo4j 不存长字段！summary 只在 Qdrant 里。
+    Qdrant 旧点保留，新点 summary = "旧 | 新"。
+    """
+    summary = (persona.get("summary") or "").strip()
+    entities = persona.get("entities") or []
+    new_pid = _gen_pid_layer(summary, "L3")
+    neo4j_old_ok = False
+    neo4j_new_ok = False
+    qdrant_new_ok = False
+    # 旧节点加 valid_time_end
+    try:
+        driver = _neo4j_driver()
+        with driver.session() as session:
+            session.run(
+                "MATCH (p:Persona {pid: $pid}) SET p.valid_time_end = $ts, p.updated = $ts",
+                pid=target_pid, ts=_now_cn_str(),
+            )
+        driver.close()
+        neo4j_old_ok = True
+    except Exception as e:
+        print(f"[warn] L3 update old vte failed: {e}", file=sys.stderr)
+    # 新节点 + ABOUT 边（按 entity name + label 建实体节点）
+    try:
+        driver = _neo4j_driver()
+        with driver.session() as session:
+            session.run(
+                """
+                MERGE (p:Persona {pid: $pid})
+                SET p.persona_type = $ptype, p.state = $state,
+                    p.importance = $imp, p.succeeds = $old_pid,
+                    p.updated = $ts
+                """,
+                pid=new_pid,
+                ptype=persona.get("type", "fact"),
+                state=persona.get("state", "active"),
+                imp=float(persona.get("importance", 0.8)),
+                old_pid=target_pid, ts=_now_cn_str(),
+            )
+            # NEXT_STATE 边（旧 → 新）
+            session.run(
+                """
+                MATCH (old:Persona {pid: $old_pid})
+                MATCH (new:Persona {pid: $new_pid})
+                MERGE (old)-[r:NEXT_STATE]->(new)
+                SET r.transition_ts = $ts
+                """,
+                old_pid=target_pid, new_pid=new_pid, ts=_now_cn_str(),
+            )
+            # ABOUT 边：每个 entity 建实体节点 + 关系
+            for ent in entities:
+                ent_name = (ent.get("name") or "").strip()
+                if not ent_name:
+                    continue
+                ent_label = _safe_label(ent.get("label"))
+                session.run(
+                    f"""
+                    MATCH (p:Persona {{pid: $pid}})
+                    MERGE (e:{ent_label} {{name: $name}})
+                    MERGE (p)-[r:ABOUT]->(e)
+                    SET r.updated = $ts
+                    """,
+                    pid=new_pid, name=ent_name, ts=_now_cn_str(),
+                )
+        driver.close()
+        neo4j_new_ok = True
+    except Exception as e:
+        print(f"[warn] L3 update neo4j new failed: {e}", file=sys.stderr)
+    # Qdrant 新点 summary 拼接
+    old_summary = ""
+    try:
+        client = _qdrant_client()
+        old_pts = client.retrieve(collection_name=L3_COLLECTION, ids=[str(target_pid)])
+        if old_pts:
+            old_summary = (old_pts[0].payload.get("summary") or "").strip()
+    except Exception as e:
+        print(f"[warn] L3 update fetch old failed: {e}", file=sys.stderr)
+    if old_summary and summary and old_summary != summary:
+        new_summary = f"{old_summary} | {summary}"
+    else:
+        new_summary = summary
+    try:
+        client = _qdrant_client()
+        qdrant_ensure_collection(L3_COLLECTION)
+        vecs = embed(new_summary)
+        if vecs:
+            vec = vecs[0] if isinstance(vecs[0], list) else vecs
+            payload = {
+                "summary": new_summary, "memory_type": "persona", "layer": "L3",
+                "persona_type": persona.get("type", "fact"),
+                "state": persona.get("state", "active"),
+                "importance": float(persona.get("importance", 0.8)),
+                "tags": persona.get("tags") or [],
+                "succeeds": target_pid,
+                "ts": _now_cn_iso(),
+            }
+            qdrant_upsert_point(client, L3_COLLECTION, new_pid, vec, payload)
+            if _qdrant_verify_point_written(L3_COLLECTION, new_pid):
+                qdrant_new_ok = True
+            else:
+                print(f"[warn] L3 update qdrant write verify failed: {new_pid}", file=sys.stderr)
+    except Exception as e:
+        print(f"[warn] L3 update qdrant new failed: {e}", file=sys.stderr)
+    return {
+        "layer": "L3", "old_pid": str(target_pid), "new_pid": new_pid,
+        "neo4j_old_ok": neo4j_old_ok, "neo4j_new_ok": neo4j_new_ok, "qdrant_new_ok": qdrant_new_ok,
+    }
+
+
+def _append_update_l2(scenario, target_pid):
+    """L2 更新：旧 Scenario 加 valid_time_end + 新 Scenario 节点 + INVOLVES 边。
+
+    ⚠️ Neo4j 不存长字段！scenario.summary 只在 Qdrant 里。
+    Qdrant 旧点保留，新点 summary = "旧 | 新"。
+    """
+    title = (scenario.get("title") or "").strip()
+    summary = (scenario.get("summary") or "").strip() or title
+    entities = scenario.get("entities") or []
+    new_scenario_id = title or summary[:50]
+    new_pid = _gen_pid_layer(new_scenario_id, "L2")
+    neo4j_old_ok = False
+    neo4j_new_ok = False
+    qdrant_new_ok = False
+    # 旧 Scenario 加 valid_time_end（按 scenario_id 主键，不是 pid）
+    try:
+        driver = _neo4j_driver()
+        with driver.session() as session:
+            session.run(
+                "MATCH (s:Scenario {scenario_id: $sid}) SET s.valid_time_end = $ts, s.updated = $ts",
+                sid=target_pid, ts=_now_cn_str(),
+            )
+        driver.close()
+        neo4j_old_ok = True
+    except Exception as e:
+        print(f"[warn] L2 update old vte failed: {e}", file=sys.stderr)
+    # 新 Scenario 节点 + INVOLVES 边
+    try:
+        driver = _neo4j_driver()
+        with driver.session() as session:
+            session.run(
+                """
+                MERGE (s:Scenario {scenario_id: $sid})
+                SET s.title = $title, s.scenario_type = $stype,
+                    s.state = $state, s.importance = $imp,
+                    s.succeeds = $old_sid, s.updated = $ts
+                """,
+                sid=new_scenario_id, title=title,
+                stype=scenario.get("type", "event"),
+                state=scenario.get("state", "historical"),
+                imp=float(scenario.get("importance", 0.7)),
+                old_sid=target_pid, ts=_now_cn_str(),
+            )
+            session.run(
+                """
+                MATCH (old:Scenario {scenario_id: $old_sid})
+                MATCH (new:Scenario {scenario_id: $new_sid})
+                MERGE (old)-[r:NEXT_STATE]->(new)
+                SET r.transition_ts = $ts
+                """,
+                old_sid=target_pid, new_sid=new_scenario_id, ts=_now_cn_str(),
+            )
+            for ent in entities:
+                ent_name = (ent.get("name") or "").strip()
+                if not ent_name:
+                    continue
+                ent_label = _safe_label(ent.get("label"))
+                session.run(
+                    f"""
+                    MATCH (s:Scenario {{scenario_id: $sid}})
+                    MERGE (e:{ent_label} {{name: $name}})
+                    MERGE (s)-[r:INVOLVES]->(e)
+                    SET r.updated = $ts
+                    """,
+                    sid=new_scenario_id, name=ent_name, ts=_now_cn_str(),
+                )
+        driver.close()
+        neo4j_new_ok = True
+    except Exception as e:
+        print(f"[warn] L2 update neo4j new failed: {e}", file=sys.stderr)
+    # Qdrant 新点 summary 拼接
+    old_summary = ""
+    try:
+        client = _qdrant_client()
+        old_pts = client.retrieve(collection_name=L2_COLLECTION, ids=[str(target_pid)])
+        if old_pts:
+            old_summary = (old_pts[0].payload.get("summary") or "").strip()
+    except Exception as e:
+        print(f"[warn] L2 update fetch old failed: {e}", file=sys.stderr)
+    if old_summary and summary and old_summary != summary:
+        new_summary = f"{old_summary} | {summary}"
+    else:
+        new_summary = summary
+    try:
+        client = _qdrant_client()
+        qdrant_ensure_collection(L2_COLLECTION)
+        text = f"{title} {new_summary}".strip()
+        vecs = embed(text)
+        if vecs:
+            vec = vecs[0] if isinstance(vecs[0], list) else vecs
+            payload = {
+                "summary": new_summary, "title": title,
+                "memory_type": "scenario", "layer": "L2",
+                "scenario_id": new_scenario_id,
+                "scenario_type": scenario.get("type", "event"),
+                "state": scenario.get("state", "historical"),
+                "entities": [e.get("name", "") for e in entities],
+                "tags": scenario.get("tags") or [],
+                "importance": float(scenario.get("importance", 0.7)),
+                "succeeds": target_pid,
+                "ts": _now_cn_iso(),
+            }
+            qdrant_upsert_point(client, L2_COLLECTION, new_pid, vec, payload)
+            if _qdrant_verify_point_written(L2_COLLECTION, new_pid):
+                qdrant_new_ok = True
+            else:
+                print(f"[warn] L2 update qdrant write verify failed: {new_pid}", file=sys.stderr)
+    except Exception as e:
+        print(f"[warn] L2 update qdrant new failed: {e}", file=sys.stderr)
+    return {
+        "layer": "L2", "old_pid": str(target_pid), "new_pid": new_pid,
+        "new_scenario_id": new_scenario_id,
+        "neo4j_old_ok": neo4j_old_ok, "neo4j_new_ok": neo4j_new_ok, "qdrant_new_ok": qdrant_new_ok,
+    }
+
+
+def _append_update_l1(ko, target_pid, target_collection):
+    """L1 更新（重写版）：旧点不动，新点新建（同 L2/L3 语义）。
+
+    L1 KO 不进 Neo4j（只存 Qdrant），所以这里不建 Neo4j 节点。
+    Qdrant 旧点保留 + 新点 summary = "旧 | 新"（拼接追加）。
+    """
+    summary = (ko.get("summary") or "").strip()
+    if not summary:
+        return {"layer": "L1", "ok": False, "reason": "缺少 summary"}
+    new_pid = _gen_pid_layer(summary, "L1")
+    old_summary = ""
+    qdrant_new_ok = False
+    try:
+        client = _qdrant_client()
+        try:
+            pid_int = int(target_pid)
+        except (ValueError, TypeError):
+            pid_int = target_pid
+        old_pts = client.retrieve(collection_name=target_collection, ids=[pid_int])
+        if old_pts:
+            old_summary = (old_pts[0].payload.get("summary") or "").strip()
+    except Exception as e:
+        print(f"[warn] L1 update fetch old failed: {e}", file=sys.stderr)
+    if old_summary and summary and old_summary != summary:
+        new_summary = f"{old_summary} | {summary}"
+    else:
+        new_summary = summary
+    try:
+        client = _qdrant_client()
+        qdrant_ensure_collection(target_collection)
+        vecs = embed(new_summary)
+        if vecs:
+            vec = vecs[0] if isinstance(vecs[0], list) else vecs
+            payload = {
+                "summary": new_summary,
+                "memory_type": ko.get("memory_type", "fact"),
+                "layer": "L1",
+                "succeeds": str(target_pid),
+                "ts": _now_cn_iso(),
+            }
+            qdrant_upsert_point(client, target_collection, new_pid, vec, payload)
+            if _qdrant_verify_point_written(target_collection, new_pid):
+                qdrant_new_ok = True
+            else:
+                print(f"[warn] L1 update qdrant write verify failed: {new_pid}", file=sys.stderr)
+    except Exception as e:
+        print(f"[warn] L1 update qdrant new failed: {e}", file=sys.stderr)
+    return {
+        "layer": "L1",
+        "old_pid": str(target_pid),
+        "new_pid": new_pid,
+        "collection": target_collection,
+        "qdrant_new_ok": qdrant_new_ok,
+    }
+
+
+def _append_update_l0(l0_payload, target_pid):
+    """L0 更新：旧 L0Conv 加 valid_time_end + 新 L0Conv 节点 + MENTIONS 边。
+
+    ⚠️ Neo4j 不存长字段！scene_summary 只在 Qdrant 里。
+    Qdrant 旧点保留，新点 summary = "旧 | 新"。
+    """
+    scene_summary = (l0_payload.get("scene_summary") or "").strip()
+    source = (l0_payload.get("source") or "").strip()
+    entities = l0_payload.get("entities") or []
+    import uuid as _uuid
+    new_pid = str(_uuid.uuid4())
+    neo4j_old_ok = False
+    neo4j_new_ok = False
+    qdrant_new_ok = False
+    # 旧 L0Conv 加 valid_time_end
+    try:
+        driver = _neo4j_driver()
+        with driver.session() as session:
+            session.run(
+                "MATCH (l:L0Conversation {l0_id: $l0_id}) SET l.valid_time_end = $ts, l.updated = $ts",
+                l0_id=target_pid, ts=_now_cn_str(),
+            )
+        driver.close()
+        neo4j_old_ok = True
+    except Exception as e:
+        print(f"[warn] L0 update old vte failed: {e}", file=sys.stderr)
+    # 新 L0Conv + NEXT_STATE + MENTIONS 边
+    try:
+        driver = _neo4j_driver()
+        with driver.session() as session:
+            session.run(
+                """
+                MERGE (l:L0Conversation {l0_id: $l0_id})
+                SET l.source = $source, l.succeeds = $old_pid, l.updated = $ts
+                """,
+                l0_id=new_pid, source=source, old_pid=target_pid, ts=_now_cn_str(),
+            )
+            session.run(
+                """
+                MATCH (old:L0Conversation {l0_id: $old_pid})
+                MATCH (new:L0Conversation {l0_id: $new_pid})
+                MERGE (old)-[r:NEXT_STATE]->(new)
+                SET r.transition_ts = $ts
+                """,
+                old_pid=target_pid, new_pid=new_pid, ts=_now_cn_str(),
+            )
+            for ent in entities:
+                ent_name = (ent.get("name") or "").strip()
+                if not ent_name:
+                    continue
+                ent_label = _safe_label(ent.get("label"))
+                session.run(
+                    f"""
+                    MATCH (l:L0Conversation {{l0_id: $l0_id}})
+                    MERGE (e:{ent_label} {{name: $name}})
+                    MERGE (l)-[r:MENTIONS]->(e)
+                    SET r.updated = $ts
+                    """,
+                    l0_id=new_pid, name=ent_name, ts=_now_cn_str(),
+                )
+        driver.close()
+        neo4j_new_ok = True
+    except Exception as e:
+        print(f"[warn] L0 update neo4j new failed: {e}", file=sys.stderr)
+    # Qdrant 新点 summary 拼接
+    old_summary = ""
+    try:
+        client = _qdrant_client()
+        old_pts = client.retrieve(collection_name=L0_COLLECTION, ids=[str(target_pid)])
+        if old_pts:
+            old_summary = (old_pts[0].payload.get("summary") or "").strip()
+    except Exception as e:
+        print(f"[warn] L0 update fetch old failed: {e}", file=sys.stderr)
+    if old_summary and scene_summary and old_summary != scene_summary:
+        new_summary = f"{old_summary} | {scene_summary}"
+    else:
+        new_summary = scene_summary
+    try:
+        client = _qdrant_client()
+        qdrant_ensure_collection(L0_COLLECTION)
+        vecs = embed(new_summary)
+        if vecs:
+            vec = vecs[0] if isinstance(vecs[0], list) else vecs
+            payload = {
+                "summary": new_summary,
+                "memory_type": "l0_conversation",
+                "layer": "L0",
+                "source": source,
+                "succeeds": target_pid,
+                "ts": _now_cn_iso(),
+            }
+            qdrant_upsert_point(client, L0_COLLECTION, new_pid, vec, payload)
+            if _qdrant_verify_point_written(L0_COLLECTION, new_pid):
+                qdrant_new_ok = True
+            else:
+                print(f"[warn] L0 update qdrant write verify failed: {new_pid}", file=sys.stderr)
+    except Exception as e:
+        print(f"[warn] L0 update qdrant new failed: {e}", file=sys.stderr)
+    return {
+        "layer": "L0", "old_pid": str(target_pid), "new_pid": new_pid,
+        "neo4j_old_ok": neo4j_old_ok, "neo4j_new_ok": neo4j_new_ok, "qdrant_new_ok": qdrant_new_ok,
+    }
+
+
 def confirm_update_4layer(token, selected_pids=None, new_memory=None):
+    """更新工具（重写版）：按"追加新节点 + NEXT_STATE 边 + summary 拼接"语义。
+
+    旧 L0/L1/L2/L3 节点不动（加 valid_time_end 标记状态结束）；
+    新节点/边新建；Qdrant 旧点保留 + 新点 summary = "旧 | 新"。
+    L1 走 process_dream._execute_update_v5（L1 自己那套成熟逻辑）。
+    """
     data = _load_action_token(token)
     if not data or data.get("action") != "update":
         return {"error": "token 无效或已过期"}
@@ -752,38 +1221,19 @@ def confirm_update_4layer(token, selected_pids=None, new_memory=None):
         if target_layer == "L1":
             l1_kos = (new_memory.get("l1") or {}).get("kos") or []
             if l1_kos:
-                from process_dream import _execute_update_v5
-                client = _qdrant_client()
-                report = {"update": 0, "qdrant_written": 0, "qdrant_updated": 0, "neo4j": {"entities": 0, "relations": 0}}
-                _execute_update_v5(
-                    l1_kos[0], l1_kos[0].get("memory_type", "fact"),
-                    target_collection, client, target_pid, report
-                )
-                updated["l1"] = report
+                updated["l1"] = _append_update_l1(l1_kos[0], target_pid, target_collection)
         elif target_layer == "L2":
             scenario = (new_memory.get("l2") or {}).get("scenario")
             if scenario:
-                result = write_l2_scenario(scenario)
-                if result.get("neo4j_ok") and result.get("qdrant_ok"):
-                    client = _qdrant_client()
-                    _qdrant_delete_point(client, L2_COLLECTION, target_pid)
-                updated["l2"] = result
+                updated["l2"] = _append_update_l2(scenario, target_pid)
         elif target_layer == "L3":
             personas = (new_memory.get("l3") or {}).get("persona") or []
             if personas:
-                result = write_l3_personas(personas)
-                if any(p.get("qdrant_ok") for p in result.get("results", [])):
-                    client = _qdrant_client()
-                    _qdrant_delete_point(client, L3_COLLECTION, target_pid)
-                updated["l3"] = result
+                updated["l3"] = _append_update_l3(personas[0], target_pid)
         elif target_layer == "L0":
             l0 = new_memory.get("l0")
             if l0:
-                result = write_l0_conversation(l0, l1_kos=(new_memory.get("l1") or {}).get("kos"))
-                if result.get("neo4j_ok") and result.get("qdrant_ok"):
-                    client = _qdrant_client()
-                    _qdrant_delete_point(client, L0_COLLECTION, target_pid)
-                updated["l0"] = result
+                updated["l0"] = _append_update_l0(l0, target_pid)
     finally:
         try: _action_token_path(token).unlink()
         except Exception: pass
@@ -830,7 +1280,7 @@ if __name__ == "__main__":
         print(json.dumps(write_4layer(payload), ensure_ascii=False, indent=2))
 
     elif args.command == "delete":
-        # 快捷模式：direct_pid + direct_collection + direct_layer → 直接删
+        # 快捷模式：direct_pid + direct_collection + direct_layer → 一次性直接删（不走 token）
         if args.direct_pid and args.direct_collection and args.direct_layer:
             client = _qdrant_client()
             layer = str(args.direct_layer)
@@ -840,15 +1290,15 @@ if __name__ == "__main__":
             try:
                 if layer == "L0":
                     if _qdrant_delete_point(client, L0_COLLECTION, pid): deleted["l0"] = 1
-                    _neo4j_soft_delete_l0(pid)
+                    _neo4j_delete_l0_node(pid)
                 elif layer == "L1":
                     if _qdrant_delete_point(client, coll, pid): deleted["l1"] = 1
                 elif layer == "L2":
                     if _qdrant_delete_point(client, L2_COLLECTION, pid): deleted["l2"] = 1
-                    _neo4j_soft_delete_scenario(pid)
+                    _neo4j_delete_scenario_node(pid)
                 elif layer == "L3":
                     if _qdrant_delete_point(client, L3_COLLECTION, pid): deleted["l3"] = 1
-                    _neo4j_soft_delete_persona(pid)
+                    _neo4j_delete_persona_node(pid)
             except Exception as e:
                 print(json.dumps({"error": str(e)}))
                 sys.exit(1)

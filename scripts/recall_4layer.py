@@ -336,6 +336,7 @@ def _collect_context_from_layer(query, collection, min_score, top_k):
             "title": pl.get("title") or "",
             "score": score,
             "layer": "L3" if collection == L3_COLLECTION else "L2",
+            "pid": hit.id,
         })
 
     return entities, scenario_ids, hits
