@@ -7,9 +7,20 @@
 [![Node.js](https://img.shields.io/badge/node-V26%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![Python](https://img.shields.io/badge/python-3.14-3776ab?logo=python&logoColor=white)](https://www.python.org/)
 
-Neo4j + Qdrant Long-Term Memory System — OpenClaw Plugin
+# Neo4j + Qdrant Long-Term Memory System — OpenClaw Plugin
 
-4-layer memory architecture (L0/L1/L2/L3) combining vector search and knowledge graphs, supporting proactive injection, passive recall, and LLM self-reflection writes.
+A 4-layer memory architecture (L0/L1/L2/L3) combining vector search and knowledge graphs, supporting proactive injection, passive recall, and LLM self-reflection writes.
+
+### Memory OS Mechanism
+
+* **Temporal Traceability** — Track the temporal evolution of memories, events, entities, and states, enabling historical reconstruction and time-aware reasoning.
+* **Dynamic State Updates** — Events, people, entities, and profile attributes can be updated as their states change over time, rather than being stored as immutable facts.
+* **State-Aware Memory** — Distinguishes historical states from current states, allowing the system to maintain evolving representations of the world and user context.
+* **Hybrid Memory Retrieval** — Combines Qdrant vector retrieval with Neo4j knowledge graphs for semantic recall, relational reasoning, and structured state tracking.
+* **Flexible Model Services** — Supports both local models and configurable API-based LLM providers, allowing the underlying model service to be changed without redesigning the memory architecture.
+* **Multi-Dimensional State Compatibility** — Designed to work with multi-dimensional context and state mechanisms, including state-machine-based runtime architectures.
+* **LLM Self-Reflection Writes** — Allows the LLM to evaluate, update, merge, or discard memories based on their relevance, temporal state, and contextual significance.
+
 
 ---
 
