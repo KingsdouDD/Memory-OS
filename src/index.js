@@ -36,6 +36,14 @@ const SERVICE_PORTS = {
   reranker: 8877,
 };
 
+// 2026-09-03 新增：服务修复命令表，供 memory_os_health 工具返回
+const SERVICE_FIX_COMMANDS = {
+  neo4j:    "brew services start neo4j",
+  qdrant:   "brew services start qdrant",
+  embed:    "launchctl kickstart gui/501/com.memoryos.embed-daemon",
+  reranker: "launchctl kickstart gui/501/com.memoryos.reranker",
+};
+
 // 端口占用检测：返回占用进程的描述字符串，没有则返回空字符串
 async function detectPortConflict(port) {
   return new Promise((resolve) => {
@@ -474,7 +482,14 @@ function logEvent(event_type, fields = {}) {
 }
 
 async function runPython(args, options = {}) {
-  await ensureServicesRunning();
+  // 2026-09-03 修复：彻底去掉 runPython 前的健康检查
+  // 原逻辑：每次调 Python 都先 await ensureServicesRunning()，
+  //        包含 ping 4 个端口 + 端口挂了等 30s 拉起，整条召回延迟 60s+
+  // 新逻辑：runPython 直接 spawn Python 子进程，不做任何端口检查。
+  //        端口挂了 → Python 脚本自己报错，错误会进 hook-trace，方便排查。
+  //        想查服务状态：用 memory_os_health 工具（按需调用，不阻塞召回）。
+  // 保留 options.skipHealth 参数仅为向后兼容（现在啥也不做）
+  void options.skipHealth;
   // 支持自定义脚本路径（默认 process_dream.py，可被 options.script 覆盖）
   const script = options.script || PYTHON_SCRIPT;
   const timeoutMs = options.timeoutMs || 0;
@@ -568,9 +583,14 @@ export default definePluginEntry({
     try { fs.appendFileSync("/tmp/hook-debug.log", `register called ${Date.now()}\n`, "utf8"); } catch {}
 
     // ── 插件启动自检 ───────────────────────────────────────────
-    // 检测所有依赖：Python环境/包/脚本/模型/服务/连通性
-    // FAIL 项 → 打印修复命令；WARN 项 → 提醒；OK 项 → 通过
-    selfCheck().catch((e) => console.error("[memory-os] 自检异常:", e.message));
+    // 2026-09-03 改造：自检不再阻塞 plugin register
+    // 原逻辑：selfCheck() 会跑 11 项检查（每项单独 spawn Python 子进程，8-10s timeout），
+    //        最坏情况跑 60+ 秒，阻塞插件加载；启动后还会被 ensureServicesRunning 每次召回前再跑一次。
+    // 新逻辑：自检改成后台 fire-and-forget，1s 后启动，不阻塞 plugin register。
+    //        想看体检结果：用 memory_os_health 工具（按需调用）。
+    setTimeout(() => {
+      selfCheck().catch((e) => console.error("[memory-os] 自检异常:", e.message));
+    }, 1000);
 
     let config = api.pluginConfig || {};
     try {
@@ -1080,6 +1100,80 @@ export default definePluginEntry({
         } finally {
           try { fs.unlinkSync(tmpFile); } catch {}
         }
+      },
+    });
+
+    // ── 工具：memory_os_health（服务体检）─────────────
+    // 2026-09-03 新增：把原来插件启动时的 11 项自检 + runPython 前的 ensureServicesRunning
+    //   都搬到这里做成按需调用的工具，不在插件启动/召回路径上自动跑。
+    // 调用方：LLM（agent）/ 用户主动调。
+    // 默认只查 4 个服务端口的在线状态（快速 < 2s），可选传 deep=true 跑 11 项完整自检。
+    api.registerTool({
+      name: "memory_os_health",
+      description: "检查 Memory OS 依赖服务的健康状态（4 个端口 + 可选 11 项深度自检）。\n\n【默认模式】只检查服务端口：Neo4j 7687 / Qdrant 6333 / Embed 8765 / Reranker 8877，耗时 < 2s。返回每个服务是否在线 + 修复命令。\n\n【深度模式】传 deep=true 跑完整 11 项自检：Python 环境 / 关键包 / 脚本文件 / 模型 / Token 目录 / 4 个服务端口 / Neo4j 认证 / Qdrant API。耗时 5-30s。\n\n【什么时候调】\n- 召回明显变慢 / 报错 / 结果不准\n- 启动时看到服务异常提示\n- 任何时候想确认服务状态\n\n【为什么需要这个工具】\n之前这些检查都跑在 plugin 启动 + 每次召回前，最坏延迟 60s+。现在改成按需调，不阻塞召回。",
+      parameters: {
+        type: "object",
+        properties: {
+          deep: {
+            type: "boolean",
+            description: "是否跑完整 11 项自检（默认 false，只查端口）",
+            default: false,
+          },
+        },
+      },
+      async execute(_id, params) {
+        const deep = !!params.deep;
+
+        // 快速模式：只查 4 个端口
+        const portChecks = [];
+        for (const [name, port] of Object.entries(SERVICE_PORTS)) {
+          const t0 = Date.now();
+          const up = await checkService(name, port).catch(() => false);
+          portChecks.push({
+            name,
+            port,
+            up,
+            latency_ms: Date.now() - t0,
+            fix_command: SERVICE_FIX_COMMANDS[name] || "(无修复命令)",
+          });
+        }
+
+        const result = {
+          mode: deep ? "deep" : "fast",
+          timestamp: new Date().toISOString(),
+          ports: portChecks,
+          all_up: portChecks.every((c) => c.up),
+        };
+
+        if (deep) {
+          // 深度模式：调 selfCheck() 拿 11 项结果
+          try {
+            const sc = await selfCheck();
+            result.deep = {
+              ok: sc.ok,
+              fails: sc.fails,
+              warns: sc.warns,
+              checks: sc.results.map((r) => ({
+                status: r.status,
+                label: r.label,
+                detail: r.detail,
+              })),
+            };
+          } catch (e) {
+            result.deep_error = String(e);
+          }
+        }
+
+        // 写一行到 hook-trace，方便排查
+        try {
+          logEvent("memory_os_health_check", {
+            mode: deep ? "deep" : "fast",
+            all_up: result.all_up,
+            down: portChecks.filter((c) => !c.up).map((c) => c.name),
+          });
+        } catch {}
+
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       },
     });
 
