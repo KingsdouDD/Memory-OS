@@ -94,7 +94,7 @@ memory-os-plugin/          # ← OpenClaw plugin root
 ├── logs/
 ├── openclaw.plugin.json
 ├── package.json
-├── README.md
+├── README.md                 # ← you are here
 ├── README_recall.md
 └── MEMORY-OS-4LAYER.md
 
