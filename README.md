@@ -1,5 +1,12 @@
 # Memory OS
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://opensource.org/licenses/MIT)
+[![Contributors](https://img.shields.io/github/contributors/KingsdouDD/Memory-OS)](https://github.com/KingsdouDD/Memory-OS/graphs/contributors)
+[![GitHub Stars](https://img.shields.io/github/stars/KingsdouDD/Memory-OS)](https://github.com/KingsdouDD/Memory-OS/stargazers)
+[![GitHub Issues](https://img.shields.io/github/issues/KingsdouDD/Memory-OS)](https://github.com/KingsdouDD/Memory-OS/issues)
+[![Node.js](https://img.shields.io/badge/node-V26%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![Python](https://img.shields.io/badge/python-3.14-3776ab?logo=python&logoColor=white)](https://www.python.org/)
+
 Neo4j + Qdrant 长期记忆系统 — OpenClaw 插件
 
 四层记忆架构（L0/L1/L2/L3），兼顾向量检索与知识图谱，支持主动注入、被动召回、LLM 自我反思写入。
