@@ -14,6 +14,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import crypto from "node:crypto";
+import * as os from "node:os";
+import { Path } from "path";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PYTHON_SCRIPT = path.resolve(__dirname, "../scripts/process_dream.py");
@@ -131,6 +133,178 @@ async function ensureServicesRunning() {
     // 不等端口就绪：启动命令 fire-and-forget，launchd KeepAlive 会自己保持进程活着
     // 端口冲突在下次实际调 Python 时会被发现并报错
   }
+}
+
+// ── 自检函数（插件启动时调用）──────────────────────────────
+async function selfCheck() {
+  const results = [];
+  const LEVEL = { OK: "✅", WARN: "⚠️", FAIL: "❌", INFO: "ℹ️" };
+
+  function add(status, label, detail = "") {
+    results.push({ status, label, detail });
+  }
+
+  // 1. Python 环境
+  add(LEVEL.INFO, "Python 环境");
+  try {
+    const child = spawn(PYTHON_BIN, ["-c", "import sys; print(sys.version.split()[0])"], {
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 8000,
+    });
+    const ver = await new Promise((res) => {
+      child.stdout.on("data", (d) => res(d.toString().trim()));
+      child.on("error", () => res(""));
+      setTimeout(() => res(""), 8000);
+    });
+    if (ver) add(LEVEL.OK, "  Python 版本", ver);
+    else add(LEVEL.FAIL, "  Python 可执行文件", `找不到或无法运行: ${PYTHON_BIN}`);
+  } catch (e) {
+    add(LEVEL.FAIL, "  Python 可执行文件", e.message);
+  }
+
+  // 2. 关键 Python 包
+  const requiredPkgs = ["neo4j", "qdrant_client", "jieba"];
+  for (const pkg of requiredPkgs) {
+    try {
+      const child = spawn(PYTHON_BIN, ["-c", `import ${pkg}; print(${pkg}.__version__ if hasattr(${pkg}, '__version__') else 'ok')`], {
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 8000,
+      });
+      const out = await new Promise((res) => {
+        child.stdout.on("data", (d) => res(d.toString().trim()));
+        child.on("error", () => res(""));
+        setTimeout(() => res(""), 8000);
+      });
+      add(out ? LEVEL.OK : LEVEL.FAIL, `  包: ${pkg}`, out || "未找到");
+    } catch (e) {
+      add(LEVEL.FAIL, `  包: ${pkg}`, e.message.split("\n")[0]);
+    }
+  }
+
+  // 3. 关键脚本文件
+  const scripts = [
+    path.resolve(__dirname, "../scripts/write_4layer.py"),
+    path.resolve(__dirname, "../scripts/recall_4layer.py"),
+    path.resolve(__dirname, "../scripts/process_dream.py"),
+  ];
+  for (const s of scripts) {
+    const exists = fs.existsSync(s);
+    add(exists ? LEVEL.OK : LEVEL.FAIL, `  脚本: ${path.basename(s)}`, exists ? "存在" : "不存在");
+  }
+
+  // 4. Embedding 模型文件
+  const modelPath = process.env.MEMORY_OS_EMBEDDING_MODEL || (process.env.HOME + "/.openclaw/workspace/memory-os/models/bge-m3-Q8_0.gguf");
+  const modelExists = fs.existsSync(modelPath);
+  add(modelExists ? LEVEL.OK : LEVEL.FAIL, "  Embedding 模型", modelExists ? path.basename(modelPath) : `不存在: ${modelPath}`);
+
+  // 5. Token 目录（可写）
+  const tokenDir = Path.home() / ".openclaw" / "workspace" / "memory-os" / "tokens";
+  try {
+    fs.mkdirSync(tokenDir, { recursive: true });
+    const testFile = path.join(tokenDir, ".write-test");
+    fs.writeFileSync(testFile, "test");
+    fs.unlinkSync(testFile);
+    add(LEVEL.OK, "  Token 目录", `可写: ${tokenDir}`);
+  } catch (e) {
+    add(LEVEL.FAIL, "  Token 目录", `无法写入: ${e.message}`);
+  }
+
+  // 6. Neo4j 服务
+  const neo4jUp = await checkService("neo4j", 7687);
+  if (neo4jUp) {
+    add(LEVEL.OK, "  Neo4j 服务", "端口 7687 在线");
+  } else {
+    add(LEVEL.FAIL, "  Neo4j 服务", "端口 7687 未监听，请运行: brew services start neo4j");
+  }
+
+  // 7. Qdrant 服务
+  const qdrantUp = await checkService("qdrant", 6333);
+  if (qdrantUp) {
+    add(LEVEL.OK, "  Qdrant 服务", "端口 6333 在线");
+  } else {
+    add(LEVEL.FAIL, "  Qdrant 服务", "端口 6333 未监听，请运行: brew services start qdrant");
+  }
+
+  // 8. Embed Daemon
+  const embedUp = await checkService("embed", 8765);
+  if (embedUp) {
+    add(LEVEL.OK, "  Embed Daemon", "端口 8765 在线");
+  } else {
+    add(LEVEL.FAIL, "  Embed Daemon", "端口 8765 未监听，请运行: launchctl kickstart gui/501/com.memoryos.embed-daemon");
+  }
+
+  // 9. Reranker Daemon
+  const rerankerUp = await checkService("reranker", 8877);
+  if (rerankerUp) {
+    add(LEVEL.OK, "  Reranker Daemon", "端口 8877 在线");
+  } else {
+    add(LEVEL.FAIL, "  Reranker Daemon", "端口 8877 未监听，请运行: launchctl kickstart gui/501/com.memoryos.reranker");
+  }
+
+  // 10. Neo4j 连通性（bolt 协议层面）
+  if (neo4jUp) {
+    try {
+      const child = spawn(PYTHON_BIN, [
+        "-c",
+        "from neo4j import GraphDatabase; "
+          + "d=GraphDatabase.driver('bolt://127.0.0.1:7687',auth=('neo4j','openclaw')); "
+          + "d.verify_connection(); d.close(); print('ok')",
+      ], { stdio: ["ignore", "pipe", "pipe"], timeout: 10000 });
+      const out = await new Promise((res) => {
+        child.stdout.on("data", (d) => res(d.toString().trim()));
+        child.on("error", () => res(""));
+        setTimeout(() => res(""), 10000);
+      });
+      add(out === "ok" ? LEVEL.OK : LEVEL.FAIL, "  Neo4j 连通性", out === "ok" ? "认证成功" : out || "连接失败");
+    } catch (e) {
+      add(LEVEL.FAIL, "  Neo4j 连通性", e.message.split("\n")[0]);
+    }
+  }
+
+  // 11. Qdrant REST API 连通性
+  if (qdrantUp) {
+    try {
+      const child = spawn("curl", ["-s", "-o", "/dev/null", "-w", "%{http_code}", "http://127.0.0.1:6333/readyz"], {
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 5000,
+      });
+      const code = await new Promise((res) => {
+        child.stdout.on("data", (d) => res(d.toString().trim()));
+        child.on("error", () => res(""));
+        setTimeout(() => res(""), 5000);
+      });
+      add(code === "200" ? LEVEL.OK : LEVEL.FAIL, "  Qdrant REST API", code === "200" ? "正常" : `HTTP ${code}`);
+    } catch (e) {
+      add(LEVEL.FAIL, "  Qdrant REST API", e.message.split("\n")[0]);
+    }
+  }
+
+  // 汇总打印
+  console.log("\n" + "═".repeat(60));
+  console.log("🍊 Memory OS 自检报告");
+  console.log("═".repeat(60));
+  for (const { status, label, detail } of results) {
+    const detailStr = detail ? `  ← ${detail}` : "";
+    console.log(`  ${status} ${label}${detailStr}`);
+  }
+  const fails = results.filter((r) => r.status === LEVEL.FAIL);
+  const warns = results.filter((r) => r.status === LEVEL.WARN);
+  console.log("═".repeat(60));
+  if (fails.length > 0) {
+    console.log(`  ${LEVEL.FAIL} 共 ${fails.length} 项不合格，请修复后再使用`);
+  } else if (warns.length > 0) {
+    console.log(`  ${LEVEL.WARN} 共 ${warns.length} 项警告，正常可用`);
+  } else {
+    console.log(`  ${LEVEL.OK} 所有检查项通过，环境正常`);
+  }
+  console.log("═".repeat(60) + "\n");
+
+  return {
+    ok: fails.length === 0,
+    fails: fails.length,
+    warns: warns.length,
+    results,
+  };
 }
 
 // 同会话 query 去重缓存：Map<sessionKey, Set<queryHash>>
@@ -325,6 +499,12 @@ export default definePluginEntry({
   register(api) {
     // 2026-08-19 调试：插件有没有被加载
     try { fs.appendFileSync("/tmp/hook-debug.log", `register called ${Date.now()}\n`, "utf8"); } catch {}
+
+    // ── 插件启动自检 ───────────────────────────────────────────
+    // 检测所有依赖：Python环境/包/脚本/模型/服务/连通性
+    // FAIL 项 → 打印修复命令；WARN 项 → 提醒；OK 项 → 通过
+    selfCheck().catch((e) => console.error("[memory-os] 自检异常:", e.message));
+
     let config = api.pluginConfig || {};
     try {
       const live = api.runtime?.config?.current?.();
