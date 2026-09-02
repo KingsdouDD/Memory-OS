@@ -131,9 +131,8 @@ memory-os/                 # ← Local runtime data (separate directory)
 | **Embed Daemon** | 8765 | `launchctl kickstart gui/501/com.memoryos.embed-daemon` |
 | **Reranker Daemon** | 8877 | `launchctl kickstart gui/501/com.memoryos.reranker` |
 
-> Plugin auto-detects service status and starts them if down.
->
-> **Self-Check**: Plugin runs 11-item quality checks on every startup (Python env / packages / scripts / models / token dir / 4 service ports / Neo4j auth / Qdrant API). FAIL items print fix commands; WARN items warn; all pass → ✅.
+> ⚠️ **2026-09-03 更新**：插件不再在召回路径上自动检查/拉起服务（会导致 60s+ 延迟）。
+> 如需检查服务状态，使用 `memory_os_health` 工具（fast 模式 < 2s，deep 模式 5-30s）。
 
 ### Embedding Model
 
@@ -170,9 +169,20 @@ python3 scripts/service_lifecycle.py status
 
 > Tip: Plugin auto-detects and starts services. Manual start only when needed.
 
-### 3. Plugin Self-Check (automatic)
+### 3. Plugin Self-Check
 
-Plugin runs 11 quality checks on every load. Checks include:
+**⚠️ 2026-09-03 重大变更**：自检不再在插件启动时同步阻塞（之前最坏 60s+ 延迟）。
+
+- **启动时**：自检在 1 秒后后台执行，结果只打印到插件日志，不阻塞插件加载
+- **按需检查**：用 `memory_os_health` 工具查看服务状态（fast < 2s，deep 5-30s）
+
+```bash
+# 在 OpenClaw 中调用（LLM/Agent 视角）
+memory_os_health()        # fast：查 4 个端口是否在线
+memory_os_health(deep=true)  # deep：跑完整 11 项自检
+```
+
+11 项自检内容：
 
 | Check | Description |
 |-------|-------------|
@@ -207,7 +217,7 @@ FAIL item example output:
 
 ---
 
-## 4 MCP Tools
+## 5 MCP Tools
 
 ### `memory_os_ingest` — Store Memories
 
@@ -326,6 +336,44 @@ FAIL item example output:
 
 ---
 
+### `memory_os_health` — Service Health Check
+
+**⚠️ 2026-09-03 新增**：按需检查服务状态，不在召回路径上自动检查（避免 60s+ 延迟）。
+
+```json
+{
+  "deep": false
+}
+```
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `deep` | boolean | false | `true` 跑完整 11 项自检（耗时 5-30s），默认 fast 只查 4 端口（< 2s） |
+
+**Fast 模式返回值示例**（< 2s）：
+
+```json
+{
+  "mode": "fast",
+  "timestamp": "2026-09-03T00:20:00.000Z",
+  "ports": [
+    { "name": "neo4j",    "port": 7687, "up": true,  "latency_ms": 12, "fix_command": "brew services start neo4j" },
+    { "name": "qdrant",   "port": 6333, "up": true,  "latency_ms":  8, "fix_command": "brew services start qdrant" },
+    { "name": "embed",    "port": 8765, "up": false, "latency_ms": 15, "fix_command": "launchctl kickstart gui/501/com.memoryos.embed-daemon" },
+    { "name": "reranker", "port": 8877, "up": true,  "latency_ms": 10, "fix_command": "launchctl kickstart gui/501/com.memoryos.reranker" }
+  ],
+  "all_up": false,
+  "down": ["embed"]
+}
+```
+
+**何时调用**：
+- 召回明显变慢 / 报错 / 结果为空
+- 启动时看到服务异常提示
+- 任何想确认服务状态的时候
+
+---
+
 ## Auto Hook Injection
 
 Plugin works automatically via OpenClaw Hook — no explicit Agent calls needed:
@@ -396,7 +444,7 @@ All parameters centralized in `scripts/recall_config.py`.
 # Start all services
 python3 scripts/service_lifecycle.py start-all
 
-# Check service status
+# Check service status (plugin log)
 python3 scripts/service_lifecycle.py status
 
 # Stop all services
@@ -410,6 +458,16 @@ MEMORY_OS_RECALL_DEBUG=1 python3 scripts/recall_4layer.py recall --query "..."
 
 # View hook trace log
 cat ~/.openclaw/workspace/memory-os/logs/hook-trace.md
+```
+
+### `memory_os_health` Tool（推荐）
+
+```json
+// Fast：< 2s 查 4 端口
+{ "tool": "memory_os_health", "params": {} }
+
+// Deep：5-30s 跑完整 11 项
+{ "tool": "memory_os_health", "params": { "deep": true } }
 ```
 
 ---
