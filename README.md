@@ -131,7 +131,6 @@ memory-os/                 # ← Local runtime data (separate directory)
 | **Embed Daemon** | 8765 | `launchctl kickstart gui/501/com.memoryos.embed-daemon` |
 | **Reranker Daemon** | 8877 | `launchctl kickstart gui/501/com.memoryos.reranker` |
 
-> ⚠️ **2026-09-03 更新**：插件不再在召回路径上自动检查/拉起服务（会导致 60s+ 延迟）。
 > 如需检查服务状态，使用 `memory_os_health` 工具（fast 模式 < 2s，deep 模式 5-30s）。
 
 ### Embedding Model
