@@ -703,7 +703,7 @@ export default definePluginEntry({
           sessionKey, chatId,
           ctxKeys: ctx ? Object.keys(ctx) : [],
         });
-        return; // 拿不到当前会话的 sessionKey 就退出，不写 fallback
+        return { prependContext: "" };
       }
 
       // before_prompt_build：用户文本可能在 event.prompt（字符串）或 event.messages 数组
@@ -727,12 +727,12 @@ export default definePluginEntry({
           messages_len: event?.messages ? event.messages.length : 0,
           messages_roles: Array.isArray(event?.messages) ? event.messages.map(m => m?.role) : [],
         });
-        return;
+        return { prependContext: "" };
       }
-      if (userText.length < 3) return;
+      if (userText.length < 3) return { prependContext: "" };
 
       const queryHash = hashQuery(userText);
-      if (isCacheHit(sessionKey, queryHash)) return;
+      if (isCacheHit(sessionKey, queryHash)) return { prependContext: "" };
 
       try {
         const recall = await runPython(
@@ -742,35 +742,34 @@ export default definePluginEntry({
         let payload;
         try { payload = JSON.parse(recall.stdout); } catch {
           logEvent("recall_parse_failed", { session: sessionKey, query: userText.slice(0,200), stderr: recall.stderr.slice(-300) });
-          return;
+          return { prependContext: "" };
         }
 
         if (payload.skipped) {
           logEvent("recall_skipped", { session: sessionKey, query: userText.slice(0,200), reason: payload.reason });
           rememberQuery(sessionKey, queryHash);
-          return;
+          return { prependContext: "" };
         }
 
         const memories = payload.memories || [];
         const block = makeMemoryInjectionBlock(memories);
-        if (!block) { rememberQuery(sessionKey, queryHash); return; }
+        if (!block) { rememberQuery(sessionKey, queryHash); return { prependContext: "" }; }
 
         if (memories.length > 0) {
           logEvent("injection_committed", {
             session: sessionKey,
             query: userText.slice(0,200),
             n_memories: memories.length,
-            summaries: memories.map((m) => (typeof m === "string" ? m : (m.summary || "")).slice(0, 60)),
             channels: payload.channels || {},
           });
         }
 
         rememberQuery(sessionKey, queryHash);
 
-        // 直接返回 prependContext，注入到当前轮的 prompt 前部
         return { prependContext: block };
       } catch (err) {
         logEvent("recall_failed", { session: sessionKey, query: userText.slice(0,200), error: String(err) });
+        return { prependContext: "" };
       }
     });
 
@@ -788,32 +787,16 @@ export default definePluginEntry({
         const combined = (sysText || "") + "\n" + (promptText || "");
         const hasMemoryHeader = combined.includes("共同记忆");
         const hasMacau = combined.includes("澳门");
-        const lines = [
-          `### ${new Date().toISOString()} llm_input`,
-          `- session: ${ctx?.sessionKey || "?"}`,
-          `- hasMemoryHeader: ${hasMemoryHeader}`,
-          `- hasMacau: ${hasMacau}`,
-          `- sys_len: ${(sysText || "").length}`,
-          `- prompt_len: ${(promptText || "").length}`,
-          `- history_len: ${historyLen}`,
-          `- prompt_head: ${(promptText || "").slice(0, 200)}`,
-          `- prompt_tail: ${(promptText || "").slice(-200)}`,
-          "",
-        ];
-        const out = lines.join("\n");
-        try { fs.appendFileSync("/tmp/llm-input-check.log", out, "utf8"); } catch {}
-        // 也写进 hook-trace（用独立事件名，方便 grep）
         logEvent("llm_input_observed", {
           session: ctx?.sessionKey || "?",
           hasMemoryHeader,
           hasMacau,
           sys_len: (sysText || "").length,
-          prompt_len: (promptText || "").length,
           history_len: historyLen,
         });
-      } catch (e) {
-        try { fs.appendFileSync("/tmp/llm-input-check.log", `### ${new Date().toISOString()} llm_input ERROR: ${String(e)}\n\n`, "utf8"); } catch {}
-      }
+        // 也写进 hook-trace（用独立事件名，方便 grep）
+        });
+      } catch (e) {}
     });
 
     // ── 工具：memory_os_ingest（存记忆 - 4 层架构）─────────────
