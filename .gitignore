@@ -57,6 +57,10 @@ __pycache__/
 *.temp
 *.bak
 
+# OpenClaw workspace runtime
+memory/
+memory-os/
+
 # =======================
 # Keep These (Public)
 # =======================
@@ -64,4 +68,6 @@ __pycache__/
 !logs/.gitkeep
 !tokens/.gitkeep
 !models/.gitkeep
+!neo4j/.gitkeep
+!qdrant/.gitkeep
 
