@@ -1,0 +1,22 @@
+# Memory OS Qdrant Configuration
+
+# Local storage path for Qdrant data
+storage_path: /Users/king/.openclaw/workspace/memory-os/qdrant/data
+
+# Qdrant service configuration
+service:
+  host: 127.0.0.1
+  port: 6333
+  http_port: 6334
+
+# Clustering (disabled for single node)
+cluster:
+  enabled: false
+
+# Storage configuration
+storage:
+  snapshots_config:
+    snapshots_path: snapshots
+  optimizers_config:
+    indexing_threshold: 20000
+    memmap_threshold: 50000

@@ -1,0 +1,5 @@
+db_path: ../neo4j/data
+host: 127.0.0.1
+port: 7687
+user: neo4j
+password: memoryos_local
