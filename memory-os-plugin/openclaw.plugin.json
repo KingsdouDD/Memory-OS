@@ -26,7 +26,7 @@
         "type": "object",
         "properties": {
           "enabled": { "type": "boolean", "default": true, "description": "是否启用 Runtime State Timer（无活动超时自动状态探查）" },
-          "timeoutMs": { "type": "integer", "default": 600000, "description": "无活动多少毫秒后触发探查，默认 10 分钟" },
+          "timeoutMs": { "type": "integer", "default": 180000, "description": "无活动多少毫秒后触发探查，默认 3 分钟" },
           "promptPath": { "type": "string", "default": "prompts/runtime_state_diff_extract.md" },
           "stateDir": { "type": "string", "default": "${HOME}/.openclaw/workspace/memory-os/runtime_active_state", "description": "临时状态文件目录（每次探查更新的中间态）" },
           "logPath": { "type": "string", "default": "${HOME}/.openclaw/workspace/memory-os/logs/runtime_state_timer.log" },

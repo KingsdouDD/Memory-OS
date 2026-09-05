@@ -18,7 +18,7 @@ import os from "node:os";
 
 // ── 配置 ──────────────────────────────────────────────
 const PLUGIN_ROOT = path.resolve(new URL(import.meta.url).pathname, "..", "..");
-const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 分钟
+const DEFAULT_TIMEOUT_MS = 3 * 60 * 1000; // 3 分钟
 const DEFAULT_PROMPT_PATH = path.join(PLUGIN_ROOT, "prompts", "runtime_state_diff_extract.md");
 const STATE_DIR = process.env.MEMORY_OS_RUNTIME_STATE_DIR ||
   path.join(process.env.HOME, ".openclaw", "workspace", "memory-os", "runtime_active_state");
