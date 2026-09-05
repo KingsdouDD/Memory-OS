@@ -584,8 +584,9 @@ export default definePluginEntry({
     try { fs.appendFileSync("/tmp/hook-debug.log", `register called ${Date.now()}\n`, "utf8"); } catch {}
 
     // ── Runtime State Timer 钩子注册 ──────────────────────────────
-    // 设计：user_request 时清零 timer，10 分钟无活动自动发探查消息
-    api.on("user_request", async (event, ctx) => {
+    // 设计：message_received 时清零 timer，3 分钟无活动自动发探查消息
+    // 注：OpenClaw 不识别 user_request hook，会被忽略；用 message_received 等价
+    api.on("message_received", async (event, ctx) => {
       try {
         const sessionKey = event?.sessionKey || ctx?.sessionKey || "unknown";
         runtimeStateTimer.onActivity(sessionKey, event, ctx);
