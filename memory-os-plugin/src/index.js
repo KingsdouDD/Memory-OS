@@ -16,6 +16,7 @@ import fs from "node:fs";
 import crypto from "node:crypto";
 import * as os from "node:os";
 import { Path } from "path";
+import runtimeStateTimer from "./runtime_state_timer.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PYTHON_SCRIPT = path.resolve(__dirname, "../scripts/process_dream.py");
@@ -581,6 +582,30 @@ export default definePluginEntry({
   register(api) {
     // 2026-08-19 调试：插件有没有被加载
     try { fs.appendFileSync("/tmp/hook-debug.log", `register called ${Date.now()}\n`, "utf8"); } catch {}
+
+    // ── Runtime State Timer 钩子注册 ──────────────────────────────
+    // 设计：user_request 时清零 timer，10 分钟无活动自动发探查消息
+    api.on("user_request", async (event, ctx) => {
+      try {
+        const sessionKey = event?.sessionKey || ctx?.sessionKey || "unknown";
+        runtimeStateTimer.onActivity(sessionKey, event, ctx);
+      } catch (e) {
+        console.error("[memory-os] runtimeStateTimer onActivity failed:", e.message);
+      }
+    });
+
+    // agent_end 时是否立刻触发探查（按 config.fireOnAgentEnd 控制，默认 false）
+    api.on("agent_end", async (event, ctx) => {
+      try {
+        const cfg = api.pluginConfig?.runtimeStateTimer || {};
+        if (cfg.fireOnAgentEnd === true) {
+          const sessionKey = event?.sessionKey || ctx?.sessionKey || "unknown";
+          runtimeStateTimer.fireNow(sessionKey, event, ctx);
+        }
+      } catch (e) {
+        console.error("[memory-os] runtimeStateTimer fireNow failed:", e.message);
+      }
+    });
 
     // ── 插件启动自检 ───────────────────────────────────────────
     // 2026-09-03 改造：自检不再阻塞 plugin register

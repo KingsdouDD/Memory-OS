@@ -1,8 +1,8 @@
 {
   "id": "memory-os",
   "name": "Memory OS",
-  "version": "1.0.0",
-  "description": "Neo4j + Qdrant long-term memory system",
+  "version": "1.1.0",
+  "description": "Neo4j + Qdrant long-term memory system + Runtime State Timer",
   "contracts": {
     "hooks": ["user_request", "message_received", "agent_end", "before_prompt_build"],
     "tools": ["memory_os_ingest", "memory_os_recall", "memory_os_update", "memory_os_delete", "memory_os_health"]
@@ -21,8 +21,18 @@
       "embeddingModel": { "type": "string", "default": "${HOME}/.openclaw/workspace/models/bge-m3-Q8_0.gguf" },
       "cronSchedule": { "type": "string", "default": "30 3 * * *" },
       "dedupThreshold": { "type": "number", "default": 0.95 },
-      "hookTraceEnabled": { "type": "boolean", "default": true,
-        "description": "开关钩子日志（hook-trace.md），默认开；设为 false 关闭写入，排查问题时再开" }
+      "hookTraceEnabled": { "type": "boolean", "default": true, "description": "开关钩子日志（hook-trace.md），默认开；设为 false 关闭写入，排查问题时再开" },
+      "runtimeStateTimer": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean", "default": true, "description": "是否启用 Runtime State Timer（无活动超时自动状态探查）" },
+          "timeoutMs": { "type": "integer", "default": 600000, "description": "无活动多少毫秒后触发探查，默认 10 分钟" },
+          "promptPath": { "type": "string", "default": "prompts/runtime_state_diff_extract.md" },
+          "stateDir": { "type": "string", "default": "${HOME}/.openclaw/workspace/memory-os/runtime_active_state", "description": "临时状态文件目录（每次探查更新的中间态）" },
+          "logPath": { "type": "string", "default": "${HOME}/.openclaw/workspace/memory-os/logs/runtime_state_timer.log" },
+          "fireOnAgentEnd": { "type": "boolean", "default": false, "description": "agent_end 时是否立刻触发探查（不等 timer）" }
+        }
+      }
     },
     "required": ["neo4jPassword"]
   }

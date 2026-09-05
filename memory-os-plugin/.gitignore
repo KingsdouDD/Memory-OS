@@ -28,3 +28,7 @@ __pycache__/
 *.local.json
 *.local.yaml
 .env
+
+# Runtime State Timer - 临时状态文件（含个人对话上下文，不上传）
+runtime_active_state/*
+!runtime_active_state/.gitkeep

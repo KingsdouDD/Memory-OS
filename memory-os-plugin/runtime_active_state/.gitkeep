@@ -1,0 +1,3 @@
+This directory holds temporary "active task state" JSON files,
+one per session. Each probe cycle updates the file with current state.
+On task completion, the state is promoted to Memory-OS (Neo4j+Qdrant).
