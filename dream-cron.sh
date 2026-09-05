@@ -90,7 +90,7 @@ echo "Write result: $RESULT"
 
 # 解析结果并发 QQ 通知
 CREATE=$(echo "$RESULT" | python3 -c "import sys,json,re; d=json.loads(sys.stdin.read()); r=d.get('write_report',{}); print(f\"create:{r.get('create',0)} update:{r.get('update',0)} errors:{r.get('errors',0)} neo4j:{r.get('neo4j',{}).get('entities',0)}e/{r.get('neo4j',{}).get('relations',0)}r qdrant:{r.get('qdrant_written',0)}w\")" 2>/dev/null || echo "parse failed")
-MSG="🍊 Memory OS 梦境入库完成 ($DATE)
+MSG=" Memory OS 梦境入库完成 ($DATE)
 $CREATE"
 echo "$MSG"
 
