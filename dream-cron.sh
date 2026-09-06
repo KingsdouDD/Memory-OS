@@ -95,6 +95,8 @@ $CREATE"
 echo "$MSG"
 
 # 发 QQ 通知
-openclaw tell qqbot:c2c:F10B2B32E462FDBD43462C3258755CE9 "$MSG" 2>/dev/null || true
+# 2026-09-06 安全修复：从 QQ_OWNER_OPENID 环境变量读，不在源码里写死 openid
+# 设置方法：export QQ_OWNER_OPENID="qqbot:c2c:<your_openid>"
+openclaw tell "${QQ_OWNER_OPENID:-qqbot:c2c:<your_openid>}" "$MSG" 2>/dev/null || true
 
 echo "[$(date)] Done"

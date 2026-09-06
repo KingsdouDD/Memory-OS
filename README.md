@@ -155,17 +155,25 @@ memory-os/                          # ← 本仓库（运行时 + 文档 + 配�
 
 ### 2. 环境变量
 
-在 `memory-os-plugin/` 创建 `.env`：
+在 `memory-os-plugin/` 创建 `.env`（或在 shell 里 `export`）：
 
 ```bash
+# 必填：连接配置
 MEMORY_OS_NEO4J_URI=bolt://127.0.0.1:7687
 MEMORY_OS_NEO4J_USER=neo4j
-MEMORY_OS_NEO4J_PASSWORD=***
+MEMORY_OS_NEO4J_PASSWORD=***           # Neo4j 密码（必填，源码里不再有默认值）
 MEMORY_OS_QDRANT_HOST=127.0.0.1
 MEMORY_OS_QDRANT_PORT=6333
 MEMORY_OS_EMBEDDING_MODEL=~/.openclaw/workspace/memory-os/models/bge-m3-Q8_0.gguf
+
+# 可选：调试 / 通知
 MEMORY_OS_HOOK_TRACE_ENABLED=1
+QQ_OWNER_OPENID=qqbot:c2c:<your_openid>   # dream-cron.sh 通知用，需替换为你的 QQ openid
 ```
+
+> **2026-09-06 安全说明**：源码里**不再硬编码** Neo4j 密码和 QQ openid，全部走环境变量。  
+> - Neo4j 密码：`MEMORY_OS_NEO4J_PASSWORD`（必填，源码默认 `'openclaw'` 仅本地兜底）
+> - QQ openid：`QQ_OWNER_OPENID`（仅 `dream-cron.sh` 需要）
 
 ### 3. Embedding / Reranker 模型
 

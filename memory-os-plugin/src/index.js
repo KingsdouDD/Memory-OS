@@ -321,10 +321,13 @@ async function selfCheck() {
   // 10. Neo4j 连通性（bolt 协议层面）
   if (neo4jUp) {
     try {
+      // 2026-09-06 安全修复：密码从环境变量读，避免源码泄露
+      // 默认值 'openclaw' 仅作本地开发兜底；正式环境请设 MEMORY_OS_NEO4J_PASSWORD
+      const neo4jPassword = process.env.MEMORY_OS_NEO4J_PASSWORD || "openclaw";
       const child = spawn(PYTHON_BIN, [
         "-c",
         "from neo4j import GraphDatabase; "
-          + "d=GraphDatabase.driver('bolt://127.0.0.1:7687',auth=('neo4j','openclaw')); "
+          + `d=GraphDatabase.driver('bolt://127.0.0.1:7687',auth=('neo4j','${neo4jPassword}')); `
           + "d.verify_connection(); d.close(); print('ok')",
       ], { stdio: ["ignore", "pipe", "pipe"], timeout: 10000 });
       const out = await new Promise((res) => {
@@ -1223,8 +1226,8 @@ export default definePluginEntry({
 
 【重要】老豆 必须 传 sessionKey（手动是唯一可靠途径）：
 - params.sessionKey 格式 = "<channel>:<user_id>"
-- QQ: "qqbot:c2c:F10B2B32E462FDBD43462C3258755CE9"
-- 微信: "weixin:<user_openid>"（老豆有多个微信，必须按 openid 区分）
+- QQ: "qqbot:c2c:<your_openid>"（替换为你自己的 QQ openid）
+- 微信: "weixin:<your_openid>"（老豆有多个微信，必须按 openid 区分）
 - Telegram: "telegram:<user_id>"
 
 如果不传 sessionKey，工具会 fallback 到 runtime context（可能拿不到，到时会让老豆重传）。老豆主动传 sessionKey 是最可靠的方式。`,
