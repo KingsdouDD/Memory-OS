@@ -5,7 +5,7 @@
   "description": "Neo4j + Qdrant long-term memory system + Runtime State Timer",
   "contracts": {
     "hooks": ["message_received", "agent_end", "before_prompt_build"],
-    "tools": ["memory_os_ingest", "memory_os_recall", "memory_os_update", "memory_os_delete", "memory_os_health"]
+    "tools": ["memory_os_ingest", "memory_os_recall", "memory_os_update", "memory_os_delete", "memory_os_health", "memory_os_extract_runtime"]
   },
   "activation": {
     "onStartup": true

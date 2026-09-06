@@ -16,7 +16,6 @@ import fs from "node:fs";
 import crypto from "node:crypto";
 import * as os from "node:os";
 import { Path } from "path";
-import runtimeStateTimer from "./runtime_state_timer.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PYTHON_SCRIPT = path.resolve(__dirname, "../scripts/process_dream.py");
@@ -48,7 +47,8 @@ const SERVICE_FIX_COMMANDS = {
 // 端口占用检测：返回占用进程的描述字符串，没有则返回空字符串
 async function detectPortConflict(port) {
   return new Promise((resolve) => {
-    const child = spawn("lsof", ["-i", `:${port}`], { stdio: ["ignore", "pipe", "pipe"] });
+    // 加 -P/-n 关闭端口名/主机名解析，否则 8765 会被解析成 ultraseek-http，字符串匹配失败
+    const child = spawn("lsof", ["-i", `:${port}`, "-P", "-n"], { stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
     child.stdout.on("data", (d) => (out += d.toString()));
     child.on("close", (code) => {
@@ -70,12 +70,13 @@ async function detectPortConflict(port) {
 
 function checkService(name, port) {
   return new Promise((resolve) => {
-    const child = spawn("lsof", ["-i", `:${port}`], { stdio: ["ignore", "pipe", "pipe"] });
+    // 加 -P/-n 关闭端口名/主机名解析，否则 8765 会被解析成 ultraseek-http，字符串匹配失败
+    const child = spawn("lsof", ["-i", `:${port}`, "-P", "-n"], { stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
     child.stdout.on("data", (d) => (out += d.toString()));
     child.on("error", () => resolve(false));
     child.on("close", (code) => {
-      const up = code === 0 && out.includes(String(port));
+      const up = code === 0 && out.includes(`:${port} `) && out.includes("LISTEN");
       console.log(`[memory-os] checkService ${name}: port=${port} code=${code} up=${up}`);
       resolve(up);
     });
@@ -582,31 +583,6 @@ export default definePluginEntry({
   register(api) {
     // 2026-08-19 调试：插件有没有被加载
     try { fs.appendFileSync("/tmp/hook-debug.log", `register called ${Date.now()}\n`, "utf8"); } catch {}
-
-    // ── Runtime State Timer 钩子注册 ──────────────────────────────
-    // 设计：message_received 时清零 timer，3 分钟无活动自动发探查消息
-    // 注：OpenClaw 不识别 user_request hook，会被忽略；用 message_received 等价
-    api.on("message_received", async (event, ctx) => {
-      try {
-        const sessionKey = event?.sessionKey || ctx?.sessionKey || "unknown";
-        runtimeStateTimer.onActivity(sessionKey, event, ctx);
-      } catch (e) {
-        console.error("[memory-os] runtimeStateTimer onActivity failed:", e.message);
-      }
-    });
-
-    // agent_end 时是否立刻触发探查（按 config.fireOnAgentEnd 控制，默认 false）
-    api.on("agent_end", async (event, ctx) => {
-      try {
-        const cfg = api.pluginConfig?.runtimeStateTimer || {};
-        if (cfg.fireOnAgentEnd === true) {
-          const sessionKey = event?.sessionKey || ctx?.sessionKey || "unknown";
-          runtimeStateTimer.fireNow(sessionKey, event, ctx);
-        }
-      } catch (e) {
-        console.error("[memory-os] runtimeStateTimer fireNow failed:", e.message);
-      }
-    });
 
     // ── 插件启动自检 ───────────────────────────────────────────
     // 2026-09-03 改造：自检不再阻塞 plugin register
@@ -1118,7 +1094,7 @@ export default definePluginEntry({
     // 默认只查 4 个服务端口的在线状态（快速 < 2s），可选传 deep=true 跑 11 项完整自检。
     api.registerTool({
       name: "memory_os_health",
-      description: "检查 Memory OS 依赖服务的健康状态（4 个端口 + 可选 11 项深度自检）。\n\n【默认模式】只检查服务端口：Neo4j 7687 / Qdrant 6333 / Embed 8765 / Reranker 8877，耗时 < 2s。返回每个服务是否在线 + 修复命令。\n\n【深度模式】传 deep=true 跑完整 11 项自检：Python 环境 / 关键包 / 脚本文件 / 模型 / Token 目录 / 4 个服务端口 / Neo4j 认证 / Qdrant API。耗时 5-30s。\n\n【什么时候调】\n- 召回明显变慢 / 报错 / 结果不准\n- 启动时看到服务异常提示\n- 任何时候想确认服务状态\n\n【为什么需要这个工具】\n之前这些检查都跑在 plugin 启动 + 每次召回前，最坏延迟 60s+。现在改成按需调，不阻塞召回。",
+      description: "检查 Memory OS 依赖服务的健康状态（4 个端口 + 可选 11 项深度自检），并自动拉起挂掉的服务。\n\n【默认模式】检查 4 个端口：Neo4j 7687 / Qdrant 6333 / Embed 8765 / Reranker 8877，耗时 < 2s。\n- embed/reranker：挂了自动调 service_lifecycle.ensure_service_up 拉起，再重新检测\n- neo4j/qdrant：挂了自动执行 brew services start\n- 最终返回每个服务的实际在线状态\n\n【深度模式】传 deep=true 跑完整 11 项自检，耗时 5-30s。\n\n【什么时候调】\n- 召回明显变慢 / 报错 / 结果不准\n- 启动时看到服务异常提示\n- 任何时候想确认服务状态\n\n贴一个命令就搞定检测 + 修复，不用手动跑命令。",
       parameters: {
         type: "object",
         properties: {
@@ -1132,11 +1108,44 @@ export default definePluginEntry({
       async execute(_id, params) {
         const deep = !!params.deep;
 
-        // 快速模式：只查 4 个端口
+        // 快速模式：只查 4 个端口，挂了的服务自动拉起
         const portChecks = [];
         for (const [name, port] of Object.entries(SERVICE_PORTS)) {
           const t0 = Date.now();
-          const up = await checkService(name, port).catch(() => false);
+          let up = await checkService(name, port).catch(() => false);
+
+          // 挂了：尝试自动拉起
+          if (!up) {
+            console.log(`[memory-os] ${name}(${port}) down，尝试拉起...`);
+            try {
+              if (name === "neo4j") {
+                await new Promise((res) =>
+                  spawn("brew", ["services", "start", "neo4j"], { stdio: ["ignore", "pipe", "pipe"] }).on("close", (c) => res(c))
+                );
+              } else if (name === "qdrant") {
+                await new Promise((res) =>
+                  spawn("brew", ["services", "start", "qdrant"], { stdio: ["ignore", "pipe", "pipe"] }).on("close", (c) => res(c))
+                );
+              } else {
+                // embed / reranker：调 service_lifecycle.ensure_service_up
+                const script = `import sys; sys.path.insert(0,'${path.resolve(__dirname, "../scripts")}'); ` +
+                  `from service_lifecycle import ensure_service_up; ` +
+                  `ok=ensure_service_up(${port}); print('ok' if ok else 'fail')`;
+                const out = await new Promise((res) => {
+                  const child = spawn(PYTHON_BIN, ["-c", script], { stdio: ["ignore", "pipe", "pipe"] });
+                  let s = "";
+                  child.stdout.on("data", (d) => (s += d.toString()));
+                  child.on("close", (c) => res({ code: c, out: s.trim() }));
+                });
+                console.log(`[memory-os] ${name} ensure_service_up result: ${JSON.stringify(out)}`);
+              }
+            } catch (e) {
+              console.error(`[memory-os] ${name} 自动拉起出错: ${e}`);
+            }
+            // 重新检测
+            up = await checkService(name, port).catch(() => false);
+          }
+
           portChecks.push({
             name,
             port,
@@ -1184,6 +1193,287 @@ export default definePluginEntry({
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       },
     });
+
+    // ── 工具：memory_os_extract_runtime（按提示词抽取 + 按状态分流）─────────────
+    // 设计：老豆手动调。工作流：
+    //   1. 老豆说"按提示词抽临时记忆"或"总结今天"
+    //   2. LLM 先读 prompts/runtime_memory_extract.md（提示词模板）
+    //   3. 按提示词规则抽取当前对话上下文 → 输出 4 层 JSON
+    //   4. 判断 status（completed / ongoing / stalled）
+    //   5. 调本工具，传 memory_json + status
+    //   6. 工具按 status 分流：
+    //      - completed → 调 write_4layer.py 写入 Memory-OS（永久） + 清空临时文件
+    //      - ongoing/stalled → 原样覆盖 runtime_active_state/{sessionKey}.json
+    // 临时文件 = LLM 抽出的 4 层 JSON 原样 + _meta 元数据（老豆原话："什么格式就存什么格式"）
+    api.registerTool((toolCtx) => ({
+      name: "memory_os_extract_runtime",
+      description: `[工作流工具] 按 prompts/runtime_memory_extract.md 提示词抽取当前对话上下文 + 按状态分流。
+
+调用步骤：
+1. 先 read_file 读取提示词模板：prompts/runtime_memory_extract.md
+2. 按提示词规则抽取当前对话上下文 → 4 层 JSON（l0/l1/l2/l3）
+3. 判断任务状态 status：
+   - completed：任务已完结，可存入永久记忆
+   - ongoing：任务进行中，覆盖临时记忆
+   - stalled：任务已停滞（老豆已转向其他话题），覆盖临时记忆
+4. 调本工具，传 memory_json + status
+5. 工具按 status 自动分流：completed → 写入 Memory-OS；ongoing/stalled → 原样覆盖临时记忆文件
+
+老豆说"按提示词抽临时记忆"、"总结今天"、"存储今天的对话"时调用。
+
+【重要】老豆 必须 传 sessionKey（手动是唯一可靠途径）：
+- params.sessionKey 格式 = "<channel>:<user_id>"
+- QQ: "qqbot:c2c:F10B2B32E462FDBD43462C3258755CE9"
+- 微信: "weixin:<user_openid>"（老豆有多个微信，必须按 openid 区分）
+- Telegram: "telegram:<user_id>"
+
+如果不传 sessionKey，工具会 fallback 到 runtime context（可能拿不到，到时会让老豆重传）。老豆主动传 sessionKey 是最可靠的方式。`,
+      parameters: {
+        type: "object",
+        properties: {
+          memory_json: {
+            type: "string",
+            description: "LLM 按 runtime_memory_extract.md 抽取的 4 层 JSON 字符串 {l0, l1, l2, l3}",
+          },
+          memory: {
+            type: "object",
+            description: "同上，4 层结构对象（与 memory_json 二选一）",
+          },
+          status: {
+            type: "string",
+            enum: ["completed", "ongoing", "stalled"],
+            description: "当前任务状态。completed → 写入 Memory-OS；ongoing/stalled → 原样覆盖临时记忆文件",
+          },
+          sessionKey: {
+            type: "string",
+            description: "会话 key（可选，默认从 plugin context 推断）",
+          },
+          next_step: {
+            type: "string",
+            description: "下一步要做什么（ongoing/stalled 时一并存进临时文件）",
+          },
+          blocked_reason: {
+            type: "string",
+            description: "阻塞原因（stalled 时存进临时文件）",
+          },
+        },
+        required: ["status"],
+      },
+      async execute(_id, params) {
+        const status = params.status || "stalled";
+        let payload = null;
+        if (params.memory_json && typeof params.memory_json === "string") {
+          try { payload = JSON.parse(params.memory_json); }
+          catch (e) {
+            return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "memory_json 解析失败: " + e.message }) }] };
+          }
+        } else if (params.memory && typeof params.memory === "object") {
+          payload = params.memory;
+        }
+
+        // 从 runtime context 动态拿 sessionKey（不依赖 params）
+        const ctxSessionKey = toolCtx?.sessionKey || toolCtx?.sessionId || "";
+        const ctxChannel = toolCtx?.messageChannel || "";
+        const ctxSender = toolCtx?.requesterSenderId || "";
+        // 动态派生 chat_id：从 channel + sender
+        const dynamicChatId = ctxChannel && ctxSender ? `${ctxChannel}:${ctxSender}` : "";
+        // sessionKey 优先级：params.sessionKey > ctx.sessionKey > 动态派生
+        const sessionKey = params.sessionKey || ctxSessionKey || dynamicChatId || "default";
+        const STATE_DIR = path.join(process.env.HOME, ".openclaw", "workspace", "memory-os", "memory-os-plugin", "runtime_active_state");
+        // 派生 agent_id：从 runtime ctx 动态拿 channel + sender（不依赖 sessionKey 字符串）
+        let agentId = "default";
+        // 优先用 ctx.messageChannel（动态来源，不依赖 params）
+        const channel = (ctxChannel || "").toLowerCase();
+        const sender = (ctxSender || "").replace(/[^a-zA-Z0-9_.-]/g, "_");
+        if (channel.includes("weixin") || channel.includes("wechat")) {
+          // 微信按用户 openid 分（老豆有多个微信账号，不能合在一起）
+          if (sender && sender !== "_") agentId = `wechat_${sender}`;
+          else agentId = "wechat_unknown";
+        } else if (channel.includes("qqbot") || channel.includes("qq")) {
+          // QQ 也按 user_id 分（不同会话不能合在一起）
+          if (sender && sender !== "_") agentId = `qq_${sender}`;
+          else agentId = "qq_unknown";
+        } else if (channel.includes("telegram")) {
+          agentId = "telegram";
+        } else if (channel.includes("discord")) {
+          agentId = "discord";
+        } else if (typeof sessionKey === "string" && sessionKey !== "default") {
+          // 备选：从 sessionKey 字符串解析
+          // 微信老格式："agent:xxx:openclaw-weixin:direct:<openid>@im.wechat"
+          const wxOld = sessionKey.match(/openclaw-weixin:[^:]*:([^@]+)@im\.wechat/i);
+          if (wxOld) {
+            const userId = wxOld[1].replace(/[^a-zA-Z0-9_.-]/g, "_");
+            agentId = `wechat_${userId}`;
+          }
+          // 微信新格式："weixin:<openid>" 或 "wechat:<openid>"
+          else {
+            const wxMatch = sessionKey.match(/^(?:wechat|weixin):([^:]+)/i);
+            if (wxMatch) {
+              const userId = wxMatch[1].replace(/[^a-zA-Z0-9_.-]/g, "_");
+              agentId = `wechat_${userId}`;
+            }
+            // QQ 老格式："agent:xxx:qqbot:direct:c2c:<user_id>"
+            else {
+              const qqOld = sessionKey.match(/qqbot:[^:]*:[^:]*:([^:]+)/i);
+              if (qqOld && qqOld[1] !== "c2c" && qqOld[1] !== "guild" && qqOld[1] !== "direct") {
+                agentId = `qq_${qqOld[1].replace(/[^a-zA-Z0-9_.-]/g, "_")}`;
+              }
+              // 其他 bot：qqbot:.../ telegram:.../ discord:...
+              else {
+                const cMatch = sessionKey.match(/^([a-z]+)bot:/i);
+                if (cMatch) agentId = cMatch[1].toLowerCase();
+                // 备选：从 sessionKey 解析 "agent:xxx:..."
+                else if (sessionKey.startsWith("agent:")) {
+                  const parts = sessionKey.split(":");
+                  // 例：agent:main:qqbot:direct:f10b2b32e462fdbd43462c3258755ce9
+                  // → "qqbot:direct:f10b2b32e462fdbd43462c3258755ce9" → "qq_f10b2b32e462fdbd43462c3258755ce9"
+                  if (parts.length >= 4 && (parts[2] === "qqbot" || parts[2] === "openclaw-qqbot")) {
+                    const userId = parts[parts.length - 1].replace(/[^a-zA-Z0-9_.-]/g, "_");
+                    agentId = `qq_${userId}`;
+                  } else if (parts.length >= 3 && parts[2] && parts[2] !== "main") {
+                    agentId = parts[2].replace(/[^a-zA-Z0-9_.-]/g, "_");
+                  } else if (parts.length >= 2 && parts[1]) {
+                    agentId = parts[1].replace(/[^a-zA-Z0-9_.-]/g, "_");
+                  }
+                }
+              }
+            }
+          }
+        }
+        const safeAgent = String(agentId).replace(/[^a-zA-Z0-9_.-]/g, "_");
+        // 按 agent 分文件：每个通道/插件一个临时记忆文件（绝对不读其他 agent 的文件）
+        const stateFile = path.join(STATE_DIR, `${safeAgent}.json`);
+        const PROMPT_PATH = path.resolve(__dirname, "../prompts/runtime_memory_extract.md");
+        logEvent("extract_runtime_resolve_agent", { sessionKey, agentId, safeAgent, stateFile });
+
+        // 分流：completed → 写 Memory-OS
+        if (status === "completed") {
+          if (!payload) {
+            return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: "completed 状态必须传 memory_json / memory", hint: "提示词模板：" + PROMPT_PATH }) }] };
+          }
+          const tmpFile = `/tmp/memory-os-extract-runtime-${Date.now()}.json`;
+          try {
+            fs.writeFileSync(tmpFile, JSON.stringify(payload), "utf-8");
+            const res = await runPython(["ingest", "--file", tmpFile], {
+              env: buildEnv(config),
+              script: path.resolve(__dirname, "../scripts/write_4layer.py"),
+            });
+            const last = res.stdout.trim().split(/\n/).filter(Boolean).pop() || "{}";
+            let report;
+            try { report = JSON.parse(last); } catch { report = { raw: res.stdout.slice(-500) }; }
+            // 清空临时文件（任务完成）
+            try { fs.unlinkSync(stateFile); } catch {}
+            logEvent("extract_runtime_ingested", { sessionKey, koCount: payload?.l1?.kos?.length || 0 });
+            return { content: [{ type: "text", text: JSON.stringify({
+              ok: true, status, action: "ingested_to_memory_os",
+              report,
+              next_hint: "任务已写入 Memory-OS（永久记忆）。临时文件已清空。",
+              prompt_template: PROMPT_PATH,
+            }, null, 2) }] };
+          } finally {
+            try { fs.unlinkSync(tmpFile); } catch {}
+          }
+        }
+
+        // 分流：ongoing / stalled → 增量覆盖临时记忆文件（多任务结构）
+        // 先读旧文件：取旧 l0.snapshot_window.to_iso 作为本次 from_iso
+        // 按 task_id 合并 scenarios：同任务覆盖，不同任务追加
+        let prev = null;
+        try {
+          if (fs.existsSync(stateFile)) {
+            const txt = fs.readFileSync(stateFile, "utf-8");
+            prev = JSON.parse(txt);
+          }
+        } catch {}
+        const prevToIso = prev?.l0?.snapshot_window?.to_iso || null;
+        if (prevToIso && payload?.l0?.snapshot_window && !payload.l0.snapshot_window.from_iso) {
+          payload.l0.snapshot_window.from_iso = prevToIso;
+        }
+        // KO 去重合并：按 summary 文本去重
+        const seenKOSummaries = new Set();
+        const mergedKOs = [];
+        for (const k of [
+          ...(prev?.l1?.kos || []),
+          ...(payload?.l1?.kos || []),
+        ]) {
+          const sig = (k?.summary || "").trim();
+          if (!sig || seenKOSummaries.has(sig)) continue;
+          seenKOSummaries.add(sig);
+          mergedKOs.push(k);
+        }
+        if (mergedKOs.length) payload.l1.kos = mergedKOs;
+        // l2.scenarios 合并：按 task_id / title 去重
+        const prevScenarios = prev?.l2?.scenarios || (prev?.l2?.scenario ? [prev.l2.scenario] : []);
+        const newScenarios = payload?.l2?.scenarios || (payload?.l2?.scenario ? [payload.l2.scenario] : []);
+        const seenScenario = new Set();
+        const mergedScenarios = [];
+        for (const s of [...prevScenarios, ...newScenarios]) {
+          const sig = (s?.task_id || s?.title || "").trim();
+          if (!sig || seenScenario.has(sig)) continue;
+          seenScenario.add(sig);
+          mergedScenarios.push(s);
+        }
+        if (mergedScenarios.length) {
+          payload.l2 = payload.l2 || {};
+          payload.l2.scenarios = mergedScenarios;
+          delete payload.l2.scenario;
+        }
+        // persona 去重合并
+        const seenPersona = new Set();
+        const mergedPersona = [];
+        for (const p of [
+          ...(prev?.l3?.persona || []),
+          ...(payload?.l3?.persona || []),
+        ]) {
+          const sig = (p?.summary || "").trim();
+          if (!sig || seenPersona.has(sig)) continue;
+          seenPersona.add(sig);
+          mergedPersona.push(p);
+        }
+        if (mergedPersona.length) payload.l3.persona = mergedPersona;
+        // _meta.tasks 多任务状态追踪
+        const prevTasks = prev?._meta?.tasks || [];
+        const newTasks = payload?._meta?.tasks || [];
+        const seenTask = new Set();
+        const mergedTasks = [];
+        for (const t of [...prevTasks, ...newTasks]) {
+          const sig = (t?.task_id || t?.title || "").trim();
+          if (!sig || seenTask.has(sig)) continue;
+          seenTask.add(sig);
+          mergedTasks.push(t);
+        }
+        // 临时文件 = 合并后的 4 层 JSON + _meta
+        const stateContent = {
+          ...(payload || {}),
+          _meta: {
+            agent_id: agentId,
+            session_key: sessionKey,
+            updated_at: new Date().toISOString(),
+            prev_to_iso: prevToIso,
+            current_task_id: payload?._meta?.current_task_id || null,
+            tasks: mergedTasks,
+          },
+        };
+        try {
+          fs.mkdirSync(STATE_DIR, { recursive: true });
+          fs.writeFileSync(stateFile, JSON.stringify(stateContent, null, 2), "utf-8");
+          logEvent("extract_runtime_state_updated", { sessionKey, status, nextStep: params.next_step });
+          return { content: [{ type: "text", text: JSON.stringify({
+            ok: true, status, action: "state_overwritten",
+            stateFile,
+            next_hint: status === "ongoing"
+              ? `任务进行中，临时记忆已覆盖。下次老豆说“按提示词抽取”时，使用上次抽取内容作为参考。`
+              : `任务已停滞。临时记忆已覆盖。如果老豆回来，可调 memory_os_recall 查历史 + 重读 ${stateFile} 继续。`,
+            prompt_template: PROMPT_PATH,
+          }, null, 2) }] };
+        } catch (e) {
+          logEvent("extract_runtime_write_failed", { sessionKey, error: e.message });
+          return { content: [{ type: "text", text: JSON.stringify({ ok: false, error: e.message }) }] };
+        }
+      },
+    }));
+
+    // ── 工具：memory_os_runtime_state_diff 已合并到 memory_os_extract_runtime，不再重复定义 ──
 
   },
 });

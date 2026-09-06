@@ -4,14 +4,14 @@
 Memory OS 服务生命周期管理
 
 所有调用 embed/reranker 服务的地方都走这里：
-- 端口没人监听 → 自动拉起 launchd 服务
+- 端口没人监听 → 直接 subprocess.Popen 前台拉起 daemon
 - 拉起后等待端口就绪再返回
 - 给 hook / dream / recall / ingest 等所有路径统一用
 
 需要满足：
 1. 进程 dead 时被使用 → 自动拉起
 2. idle 超时后进程自己退出 → 保持 dead 状态
-3. launchd 不会自动拉（避免变成常驻）
+3. 父进程退出时，spawn 出来的 daemon 一起退出（start_new_session=False）
 """
 
 import os
@@ -21,12 +21,25 @@ import sys
 import time
 from pathlib import Path
 
-PLIST_DIR = Path.home() / "Library" / "LaunchAgents"
+PLUGIN_DIR = Path(__file__).resolve().parent
+PLUGIN_ROOT = PLUGIN_DIR.parent  # memory-os-plugin/
+MEMORY_OS_ROOT = PLUGIN_ROOT.parent  # memory-os/
+VENV_PYTHON = MEMORY_OS_ROOT / "venv" / "bin" / "python"
 
-# 端口 → launchd label 映射
+# 端口 → daemon 启动配置
 SERVICE_MAP = {
-    8765: "com.memoryos.embed-daemon",
-    8877: "com.memoryos.reranker",
+    8765: {
+        "script": PLUGIN_DIR / "embed_daemon.py",
+        "model": Path.home() / ".openclaw/workspace/memory-os/models/bge-m3-mlx-8bit",
+        "args": ["--host", "127.0.0.1", "--port", "8765"],
+        "log": "/tmp/memory-os-embed.log",
+    },
+    8877: {
+        "script": PLUGIN_DIR / "reranker_daemon.py",
+        "model": Path.home() / ".openclaw/workspace/memory-os/models/Qwen3-Reranker-0.6B-4bit",
+        "args": ["--host", "127.0.0.1", "--port", "8877"],
+        "log": "/tmp/memory-os-reranker.log",
+    },
 }
 
 
@@ -67,52 +80,68 @@ def _wait_port_free(host: str, port: int, max_wait: float = 30.0) -> bool:
     return False
 
 
+def _spawn_daemon(port: int) -> bool:
+    """直接 Popen 启动 daemon 进程，stdout/stderr 重定向到日志文件。"""
+    cfg = SERVICE_MAP.get(port)
+    if not cfg:
+        print(f"[service_lifecycle] no mapping for port {port}", file=sys.stderr)
+        return False
+
+    script = cfg["script"]
+    model_path = cfg["model"]
+    if not script.exists():
+        print(f"[service_lifecycle] script not found: {script}", file=sys.stderr)
+        return False
+    if not Path(model_path).exists():
+        print(f"[service_lifecycle] model not found: {model_path}", file=sys.stderr)
+        return False
+
+    python_bin = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
+    cmd = [python_bin, str(script), "--model", str(model_path)] + cfg["args"]
+
+    log_fp = open(cfg["log"], "a", buffering=1)
+    log_fp.write(f"\n--- spawn {time.strftime('%Y-%m-%d %H:%M:%S')} {' '.join(cmd)} ---\n")
+    log_fp.flush()
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_fp,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=False,  # 父进程退出时一起退出
+        )
+        print(f"[service_lifecycle] spawned pid={proc.pid} port={port} log={cfg['log']}", file=sys.stderr)
+        return True
+    except Exception as e:
+        print(f"[service_lifecycle] spawn failed: {e}", file=sys.stderr)
+        return False
+
+
 def ensure_service_up(port: int, host: str = "127.0.0.1", max_wait: float = 90.0) -> bool:
     """确保指定端口的服务在运行。
 
     逻辑：
     1. 端口有人监听 → 直接返回
-    2. 端口没人 → launchctl load 拉起（不杀进程，避免 TIME_WAIT 端口冲突）
-    3. 如果端口还被占着（TIME_WAIT），等最多 30 秒再试
-    4. 等待端口就绪（最长 max_wait 秒）
-    5. 返回 True 表示拉起成功，False 表示超时
+    2. 端口没人 → 直接 spawn 守护进程（不走 launchctl）
+    3. 等待端口就绪（最长 max_wait 秒）
     """
     if _port_listening(host, port):
         return True
 
-    label = SERVICE_MAP.get(port)
-    if not label:
-        print(f"[service_lifecycle] no plist mapping for port {port}", file=sys.stderr)
+    cfg = SERVICE_MAP.get(port)
+    if not cfg:
+        print(f"[service_lifecycle] no mapping for port {port}", file=sys.stderr)
         return False
 
-    plist_path = PLIST_DIR / f"{label}.plist"
-    uid = os.getuid()
+    if not _spawn_daemon(port):
+        return False
 
-    for attempt in range(3):
-        # 先等端口释放（处理 TIME_WAIT 残留）
-        if not _port_listening(host, port):
-            print(f"[service_lifecycle] port {port} free, loading {label} ...", file=sys.stderr)
-            try:
-                subprocess.run(
-                    ["launchctl", "kickstart", f"gui/{uid}/{label}"],
-                    check=True, timeout=10,
-                )
-            except Exception as e:
-                print(f"[service_lifecycle] load failed (attempt {attempt+1}): {e}", file=sys.stderr)
-        else:
-            print(f"[service_lifecycle] port {port} still in use, waiting ...", file=sys.stderr)
+    if _wait_port_ready(host, port, max_wait=max_wait):
+        print(f"[service_lifecycle] port {port} ready", file=sys.stderr)
+        return True
 
-        # 等待端口就绪
-        if _wait_port_ready(host, port, max_wait=max_wait):
-            print(f"[service_lifecycle] port {port} ready", file=sys.stderr)
-            return True
-
-        # 端口还没好，等一下再试（给系统时间彻底释放端口）
-        if attempt < 2:
-            print(f"[service_lifecycle] port {port} not ready, retrying ...", file=sys.stderr)
-            time.sleep(2.0)
-
-    print(f"[service_lifecycle] port {port} failed to start within {max_wait}s", file=sys.stderr)
+    print(f"[service_lifecycle] port {port} failed to start within {max_wait}s (see {cfg['log']})", file=sys.stderr)
     return False
 
 
