@@ -376,7 +376,7 @@ ${RUNTIME_ACTIVE_STATE_DIR}/${agent_id}.json
   - `qqbot:c2c:...` / `qqbot:direct:...` / `qqbot:guild:...` → `qq`
   - `telegram:...` → `telegram`
   - `discord:...` → `discord`
-  - `wechat:user_openid:...` / `weixin:user_openid:...` → `wechat_user_openid`（**老豆有多个微信账号，按用户 openid 分文件**）
+  - `wechat:user_openid:...` / `weixin:user_openid:...` → `wechat_user_openid`（**用户有多个微信账号，按用户 openid 分文件**）
   - `agent:gh-issues:...`（subagent）→ `gh-issues`
   - 默认：`default`
 
@@ -387,9 +387,9 @@ ${RUNTIME_ACTIVE_STATE_DIR}/${agent_id}.json
 - Telegram 通道 → `runtime_active_state/telegram.json`
 - gh-issues subagent → `runtime_active_state/gh-issues.json`
 
-**为什么按通道/插件类型分文件**：不同通道的记忆互不污染；同一通道的对话都写同一个文件，跨用户/跨群连续；老豆跑 gh-issues subagent 时不污染 QQ 记忆。
+**为什么按通道/插件类型分文件**：不同通道的记忆互不污染；同一通道的对话都写同一个文件，跨用户/跨群连续；用户跑 gh-issues subagent 时不污染 QQ 记忆。
 
-**读写隔离**：读取旧临时文件时，**只读本 agent 的文件**（`${agent_id}.json`），**绝对不能读其他 agent 的文件**。老豆是 QQ 通道就只能读 `qq.json`，不能读 `telegram.json` / `gh-issues.json` / 其他任何 agent 的临时文件。写入也一样：只写 `${agent_id}.json`。
+**读写隔离**：读取旧临时文件时，**只读本 agent 的文件**（`${agent_id}.json`），**绝对不能读其他 agent 的文件**。用户是 QQ 通道就只能读 `qq.json`，不能读 `telegram.json` / `gh-issues.json` / 其他任何 agent 的临时文件。写入也一样：只写 `${agent_id}.json`。
 
 ### 7.6.2 多任务结构
 
