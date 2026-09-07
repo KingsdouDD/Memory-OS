@@ -22,13 +22,20 @@
 
 import os
 import sys
+
+# ── numpy 兼容补丁（老库依赖 np.bool_ / np.int8 等 numpy 1.x 别名）──────────
+# 必须放在所有 import 之前，让 qdrant_client / neo4j 能在 numpy 2.0+ 下正常加载
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import _numpy_compat  # noqa: F401
+except Exception:
+    pass
+
 import json
 import pickle
 import threading
 import time
 from pathlib import Path
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from process_dream import embed, _qdrant_client
 from recall_fusion import fusion_post_fuse, fusion_boost_graph_hits, kg_verify_v2, association_expand
@@ -642,8 +649,14 @@ def recall_4layer(query, top_k=5, layers=None):
                                 filter_entities.append(obj)
                 graph_prf_triggered = True
 
-    # ── Step 4: L1 主召回 ────────────────────────────────────────
+    # ── Step 4: 向量召回（无条件，单一路径，top 20，水位 0.62）────────────
+    # 老豆 2026-09-07 设计意图：
+    #   - 不再有"Path A / Path B"分支（这是我之前臆想的）
+    #   - 统一走纯向量召回，entity filter 不再是硬过滤（删）
+    #   - top_k = 20（在 0.62 水位基础上保证候选充足）
+    #   - 召回范围 = RecallConfig.COLLECTIONS（保持原有 L1 collection 集合）
     atom = []
+    vec = None
     if "L1" in layers:
         try:
             vecs = embed(query)
@@ -654,47 +667,43 @@ def recall_4layer(query, top_k=5, layers=None):
             print(f"[warn] L1 embed failed: {e}", file=sys.stderr)
             vecs = []
 
-        if vecs:
-            # 统一走纯向量搜索（entity filter 改作 re-ranking 信号，不硬过滤）
-            if filter_entities or filter_scenario_ids:
-                # Path A: 拉更多候选（top_k * 4），再用 entity overlap 重排
-                hits = _qdrant_search_filtered(
-                    vec, RecallConfig.COLLECTIONS, top_k=top_k * 4,
-                    filter_ents=filter_entities,
-                    filter_scenario_ids=filter_scenario_ids,
-                )
-                items = _build_l1_items_from_hits(hits)
-            else:
-                # Path B: 无 filter → 直接用 process_dream.recall
+        if vecs and vec is not None:
+            # 统一走纯向量召回，无 entity 硬过滤
+            try:
+                from process_dream import _qdrant_client
+                client = _qdrant_client()
+                hits_raw = []
+                for coll in RecallConfig.COLLECTIONS:
+                    try:
+                        resp = client.query_points(
+                            collection_name=coll,
+                            query=vec,
+                            limit=20,                        # 老豆要求 top 20
+                            score_threshold=0.62,            # 水位 0.62 不动
+                        )
+                        for hit in resp.points:
+                            hits_raw.append({
+                                "coll": coll,
+                                "pid": hit.id,
+                                "score": float(hit.score),
+                                "payload": hit.payload or {},
+                            })
+                    except Exception as e:
+                        print(f"[warn] vec recall {coll}: {e}", file=sys.stderr)
+                items = _build_l1_items_from_hits(hits_raw)
+            except Exception as e:
+                print(f"[warn] vec recall failed: {e}", file=sys.stderr)
                 items = []
 
-            if not items:
-                # 兜底：用 process_dream.recall（它内部有完整的 vec+graph+bm25 融合）
-                try:
-                    from process_dream import recall as l1_recall
-                    result = l1_recall(query, top_k=top_k * 2)
-                    raw_memories = result.get("memories", [])
-                    for m in raw_memories:
-                        if isinstance(m, dict):
-                            items.append(m)
-                        elif isinstance(m, str):
-                            items.append({"summary": m, "score": 0.0, "relation": ""})
-                except Exception as e:
-                    print(f"[warn] L1 fallback recall failed: {e}", file=sys.stderr)
-
-            # entity overlap 重排（无论有没有 filter_entities 都做）
+            # entity overlap 重排保留（老豆要求 entity overlap 作为加权信号，不是硬过滤）
             if filter_entities and items:
                 items = _rerank_by_entity_overlap(items, filter_entities)
                 items.sort(key=lambda x: -x.get("combined_score", x.get("score", 0)))
 
-            atom = items[:top_k * 2]
+            atom = items[:20]   # 老豆要求 top 20
 
-    # ── Step 5: Pre-filter by entity overlap（不做 Reranker，减少调用）──────────
-    # 用 entity_overlap + vector_score 做粗排，保留 top_k×3 进入候选池
-    if atom and filter_entities:
-        atom = _rerank_by_entity_overlap(atom, filter_entities)
-        atom.sort(key=lambda x: -x.get("combined_score", x.get("score", 0)))
-        atom = atom[:top_k * 3]   # Pre-filter：保留 3 倍候选量
+    # ── Step 5: 已删除（与 Step 4 entity overlap 重排重复）──────────
+    # 老豆 2026-09-07 设计：保留 Step 4 里的 entity overlap 重排一次即可
 
     # ── Step 6: Association Expansion（联想记忆）────────────────────
     # 如果 L3/L2 有召回 entities → 用 filter_entities 启动联想
@@ -819,14 +828,10 @@ def recall_4layer(query, top_k=5, layers=None):
                     4,
                 )
 
-    # Pre-filter：rerank score 水位过滤（0.55，低于直接丢弃）
-    before_rerank = len(merged_atom)
-    merged_atom = [
-        m for m in merged_atom
-        if m.get("rerank_score", 0) >= 0.55
-    ]
-
-    # 最终排序 + output k
+    # 老豆 2026-09-07 设计：删除 0.55 rerank score 硬过滤
+    # 重排后直接取 top 5（top_k）作为最终输出，不再做硬过滤
+    # 原因：Reranker 对情感化 query + 事实性 memory 的打分天然偏低
+    #       0.55 水位会把合理命中都砍掉，导致 memory_os_recall 返回 0 条
     merged_atom.sort(key=lambda x: -x.get("final_score", x.get("score", 0)))
     merged_atom = merged_atom[:top_k]
 

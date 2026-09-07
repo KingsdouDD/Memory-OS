@@ -17,6 +17,13 @@ CLI：
   ingest-kos --file <kos.json>      # 纯写库（agent 已抽取好的 KO JSON）
 """
 
+# ── numpy 兼容补丁（老库依赖 np.bool_ / np.int8 等 numpy 1.x 别名）──────────
+# 必须放在所有 import 之前，让 qdrant_client / neo4j 能在 numpy 2.0+ 下正常加载
+try:
+    import _numpy_compat  # noqa: F401
+except Exception:
+    pass
+
 import os
 import sys
 import json

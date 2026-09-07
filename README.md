@@ -76,15 +76,17 @@ User Input
 ┌──────────────────────────────────────┐
 │  4-Layer Recall（recall_4layer.py）   │
 │                                      │
-│  Step 1: L3 recall（persona）        │  → Extract entities
-│  Step 2: L2 recall（scenario）        │  → Extract entities + ids
-│  Step 2.5: jieba entity supplement   │
-│  Step 3: Graph PRF（Neo4j 1-hop）    │
-│  Step 4: L1 main recall（vec+BM25+Graph）│  Three paths → RRF fusion
-│  Step 5: Pre-filter（entity overlap）│
-│  Step 6: Association Expansion        │  ← Neo4j multi-hop + Qdrant assoc
-│  → Dedupe + single Reranker × 1      │
-│  → Final Top-K                       │
+│  Step 0: query 向量化                │
+│  Step 1: L3 recall（persona, 0.62, top 20）│  → 路由信号: entities
+│  Step 2: L2 recall（scenario, 0.62, top 20）│  → 路由信号: scenario_ids
+│  Step 2.5: jieba entity 补充          │
+│  Step 3: Neo4j graph (多跳联想)       │  → entities 给候选池加分
+│  Step 4: 向量召回 (Qdrant 跨层, 0.62)│  → 唯一主召回路径（无 Path A/B）
+│         BM25 (memory_l0 only, 旁路)   │  → 不进主输出
+│  Step 6: 融合重排 + Reranker × 1     │
+│         final_score = rerank×0.6 + overlap×0.4 │
+│         ❌ 删除了 0.55 rerank score 硬过滤
+│  → 取 top 5 → PID 关联 L1 → 输出     │
 └──────────────────────────────────────┘
    │
    ▼
@@ -96,6 +98,12 @@ User Input
    ▼
   LLM Output (with injected memories)
 ```
+
+> **详细架构 / 改动说明 / 召回链路 trace / 性能基线** →
+> 见 [`ARCHITECTURE.md`](ARCHITECTURE.md)
+>
+> 关键改动 (2026-09-07): Step 4 Path A/B 删除改为单一向量召回; Reranker 0.55 硬过滤删除;
+> 新增 `scripts/_numpy_compat.py` (Python 3.14 + numpy 2.0+ 兼容).
 
 ---
 
