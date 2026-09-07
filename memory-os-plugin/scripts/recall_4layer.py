@@ -774,29 +774,11 @@ def recall_4layer(query, top_k=5, layers=None):
             m["recall_reason"] = "直接匹配"
 
     merged_atom = list(atom)
-    for c in assoc_candidates:
-        full_sum = c.get("summary", "")
-        if full_sum and full_sum not in seed_summaries_full:
-            merged_atom.append({
-                "summary": full_sum,
-                "relation": c.get("relation", "") or "",
-                "score": c.get("score", 0),
-                "rerank_score": c.get("rerank_score", 0),
-                "assoc_score": c.get("assoc_score", 0),
-                "hop_depth": c.get("hop_depth", 1),
-                "association_path": c.get("association_path", []),
-                "final_score": c.get("final_score", 0),
-                "source": c.get("source", "assoc"),
-                "_qdrant_pid": c.get("_qdrant_pid"),
-                "importance": c.get("importance", 0.5),
-                "event_time": c.get("event_time") or {},
-                "valid_time": c.get("valid_time") or {},
-                "ts": c.get("ts", ""),
-                "tags": c.get("tags") or [],
-                "entities": c.get("entities") or [],
-                "recall_reason": c.get("recall_reason", "通过联想激活"),
-                "_is_assoc": c.get("_is_assoc", False),
-            })
+    # 老豆 2026-09-07 修复：Neo4j 联想扩散的候选不再进 merged_atom
+    # 原因：联想扩散会从实体（如“外婆”）跳到与 query 语义无关的其他实体（“老豆/用户/小橘子”）
+    #       这些候选跟用户实际想问的东西不相关，进了最终输出会污染召回
+    # 保留功能： Neo4j 还能给直接命中项加分（上面 Step 3 PRF + Step 4 entity overlap 重排）
+    # 所以下面这段不再把 assoc_candidates 接入 merged_atom
 
     # ── 统一 Reranker（一次调用，精排全部候选）──────────────────────
     # retrieval_top_k: 合并后进入 Reranker 的候选数量
@@ -814,19 +796,12 @@ def recall_4layer(query, top_k=5, layers=None):
         for i, m in enumerate(merged_atom):
             rr = rerank_map.get(i, 0.0)
             m["rerank_score"] = rr
-            # 综合打分：
-            #   seed 记忆（_is_assoc=False）：rerank × 0.6 + entity_overlap × 0.4
-            #   联想记忆（_is_assoc=True）：rerank × 0.6 + assoc_score × 0.4
-            if m.get("_is_assoc"):
-                m["final_score"] = round(
-                    rr * 0.6 + m.get("assoc_score", 0) * 0.4,
-                    4,
-                )
-            else:
-                m["final_score"] = round(
-                    rr * 0.6 + m.get("entity_overlap", 0) * 0.4,
-                    4,
-                )
+            # 老豆 2026-09-07 修复：联想记忆不再进 merged_atom
+            # 所以只走 entity_overlap 分支
+            m["final_score"] = round(
+                rr * 0.6 + m.get("entity_overlap", 0) * 0.4,
+                4,
+            )
 
     # 老豆 2026-09-07 设计：删除 0.55 rerank score 硬过滤
     # 重排后直接取 top 5（top_k）作为最终输出，不再做硬过滤
@@ -941,8 +916,8 @@ if __name__ == "__main__":
             result = recall_for_hook(args.query, top_k=args.top_k)
             print(json.dumps(result, ensure_ascii=False))
         else:
+            # 老豆 2026-09-07 修复：CLI 模式要保留 memories 字段
+            # 原因：OpenClaw 工具读 payload.memories 判断是否空
+            # 原代码过滤掉了，导致有数据时也返回 empty:true
             result = recall_4layer(args.query, top_k=args.top_k)
-            print(json.dumps(
-                {k: v for k, v in result.items() if k != "memories"},
-                ensure_ascii=False, indent=2,
-            ))
+            print(json.dumps(result, ensure_ascii=False, indent=2))

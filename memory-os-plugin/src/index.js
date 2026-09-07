@@ -593,6 +593,13 @@ async function runPython(args, options = {}) {
     }
     child.on("close", (code) => {
       if (timer) clearTimeout(timer);
+      // 老豆 2026-09-07 debug：把 stdout/stderr 写出来看工具实际收到的输出
+      try {
+        const fs = require("fs");
+        fs.writeFileSync("/tmp/openclaw_recall_debug.json", stdout);
+        fs.appendFileSync("/tmp/openclaw_recall_debug.err", stderr);
+        fs.appendFileSync("/tmp/openclaw_recall_debug.err", `\n--- exit code: ${code} ---\n`);
+      } catch {}
       if (code === 0) resolve({ stdout, stderr });
       else {
         const isRealError = /^(Error|Exception|Traceback|Traceback |SyntaxError|KeyError|TypeError|NameError)/m.test(stderr);
@@ -629,17 +636,22 @@ function getSessionKey(event, ctx) {
 
 function buildEnv(cfg) {
   if (!cfg) return {};
-  return {
+  // 老豆 2026-09-07 修复：环境变量未设置时不要传空字符串
+  // 原因：process_dream.py 用 os.environ.get(..., "default") 兜底，
+  //       但 get 只在 var 不存在时才返回 default；如果传 ""，会覆盖 default，
+  //       导致 url=f"http://{QDRANT_HOST}:{QDRANT_PORT}" 变成 "http://:6333" 报错
+  const env = {
     NO_PROXY: '127.0.0.1,localhost,::1',
     no_proxy: '127.0.0.1,localhost,::1',
-    MEMORY_OS_NEO4J_URI: cfg.neo4jUri || "",
-    MEMORY_OS_NEO4J_USER: cfg.neo4jUser || "",
-    MEMORY_OS_NEO4J_PASSWORD: cfg.neo4jPassword || "",
-    MEMORY_OS_QDRANT_HOST: cfg.qdrantHost || "",
-    MEMORY_OS_QDRANT_PORT: String(cfg.qdrantPort || 6333),
-    MEMORY_OS_EMBEDDING_MODEL: cfg.embeddingModel || "",
-    MEMORY_OS_DEDUP_THRESHOLD: String(cfg.dedupThreshold || 0.95),
   };
+  if (cfg.neo4jUri) env.MEMORY_OS_NEO4J_URI = cfg.neo4jUri;
+  if (cfg.neo4jUser) env.MEMORY_OS_NEO4J_USER = cfg.neo4jUser;
+  if (cfg.neo4jPassword) env.MEMORY_OS_NEO4J_PASSWORD = cfg.neo4jPassword;
+  if (cfg.qdrantHost) env.MEMORY_OS_QDRANT_HOST = cfg.qdrantHost;
+  if (cfg.qdrantPort) env.MEMORY_OS_QDRANT_PORT = String(cfg.qdrantPort);
+  if (cfg.embeddingModel) env.MEMORY_OS_EMBEDDING_MODEL = cfg.embeddingModel;
+  if (cfg.dedupThreshold !== undefined) env.MEMORY_OS_DEDUP_THRESHOLD = String(cfg.dedupThreshold);
+  return env;
 }
 
 function makeMemoryInjectionBlock(memories) {
@@ -985,15 +997,16 @@ export default definePluginEntry({
         const layersArg = layers.join(",");
         let res;
         try {
-          // 2026-09-07 老豆要求修复：兜底超时 30s
-          // recall_4layer.py 内部已加了服务拉起机制，这个超时是最终防线
-          // 超时后返回明确错误，LLM 调 health 拉起服务后重试
+          // 2026-09-07 老豆要求修复：去掉超时限制
+          // 工具本身有错误反馈机制（ok:false + message + suggested_next），
+          // 硬超时会让冷启动场景（embed/reranker 模型首次加载需要 30s+）被杀掉。
+          // 让 recall 脚本自己跑完，成功/失败都返回。
           res = await runPython([
             "recall", "--query", String(params.query), "--top-k", String(topK),
           ], {
             env: buildEnv(config),
             script: path.resolve(__dirname, "../scripts/recall_4layer.py"),
-            timeoutMs: 30000,
+            // timeoutMs 留 0 (不超时) — 跟 runPython 默认一致
           });
         } catch (err) {
           // runPython 抛错（服务未启动 / 端口连不上 / Python 脚本崩溃等）
@@ -1032,18 +1045,21 @@ export default definePluginEntry({
           return { content: [{ type: "text", text: JSON.stringify(payload) }] };
         }
         // 检查是否真的召回到了内容（4 层都没结果也要明确反馈，避免静默成功）
-        const layerResults = payload && payload.layers ? payload.layers : {};
-        const layerKeys = Object.keys(layerResults);
-        const totalHits = layerKeys.reduce((sum, k) => {
-          const items = layerResults[k];
-          return sum + (Array.isArray(items) ? items.length : 0);
-        }, 0);
-        if (totalHits === 0 && layerKeys.length > 0) {
+        // 老豆 2026-09-07 修复：原逻辑假设 payload.layers 是 dict，实际是字符串数组 ["L3","L2","L1"]
+        //   导致 Object.keys 返回索引数组，Array.isArray(items)=false，totalHits 永远是 0
+        // 新逻辑：直接检查 payload.atom / persona / scenario / assoc_candidates / memories 的长度
+        const atomCount = Array.isArray(payload?.atom) ? payload.atom.length : 0;
+        const personaCount = Array.isArray(payload?.persona) ? payload.persona.length : 0;
+        const scenarioCount = Array.isArray(payload?.scenario) ? payload.scenario.length : 0;
+        const assocCount = Array.isArray(payload?.assoc_candidates) ? payload.assoc_candidates.length : 0;
+        const memoriesCount = Array.isArray(payload?.memories) ? payload.memories.length : 0;
+        const totalHits = atomCount + personaCount + scenarioCount + assocCount + memoriesCount;
+        if (totalHits === 0) {
           // 服务正常但确实没数据
           payload.ok = true;
           payload.empty = true;
-          payload.message = `召回完成，但 4 层记忆中没有与 query "${params.query}" 相关的内容（layers: ${layerKeys.join(",")}，共 0 条）。如需写入新记忆，请用 memory_os_ingest。`;
-        } else if (totalHits > 0) {
+          payload.message = `召回完成，但 4 层记忆中没有与 query "${params.query}" 相关的内容（共 0 条）。如需写入新记忆，请用 memory_os_ingest。`;
+        } else {
           payload.ok = true;
           payload.empty = false;
         }
