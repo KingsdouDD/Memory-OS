@@ -83,6 +83,81 @@ function checkService(name, port) {
   });
 }
 
+// 2026-09-07 老豆要求修复：端口 up ≠ 模型就绪
+// 端口在监听但模型未加载完，recall 会卡死。
+// 这里真去推一个 /health 请求，超时 2s 判断模型是否热加载完成。
+function probeModelReady(port, timeoutMs = 2000) {
+  return new Promise((resolve) => {
+    const req = require("http").get(
+      { host: "127.0.0.1", port, path: "/health", timeout: timeoutMs },
+      (res) => {
+        let body = "";
+        res.on("data", (c) => (body += c));
+        res.on("end", () => resolve({ ready: res.statusCode === 200, status: res.statusCode, body: body.slice(0, 200) }));
+      }
+    );
+    req.on("timeout", () => { req.destroy(); resolve({ ready: false, error: "timeout" }); });
+    req.on("error", (e) => resolve({ ready: false, error: String(e.message || e) }));
+  });
+}
+
+// 2026-09-07 老豆要求修复：模型拉不起来时强杀旧进程
+// lsof 找占用端口的 PID，kill -9，逐个等退出
+function killPortProcess(port) {
+  return new Promise((resolve) => {
+    const child = spawn("lsof", ["-i", `:${port}`, "-P", "-n", "-t"], { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    child.stdout.on("data", (d) => (out += d.toString()));
+    child.on("error", (e) => resolve({ pids: [], error: String(e.message || e) }));
+    child.on("close", (code) => {
+      if (code !== 0 || !out.trim()) {
+        resolve({ pids: [], error: null });
+        return;
+      }
+      const pids = out.trim().split(/\s+/).filter(Boolean).map((s) => parseInt(s, 10)).filter((n) => Number.isFinite(n));
+      if (pids.length === 0) {
+        resolve({ pids: [], error: null });
+        return;
+      }
+      let killed = [];
+      let err = null;
+      let done = 0;
+      for (const pid of pids) {
+        try {
+          process.kill(pid, "SIGKILL");
+          killed.push(pid);
+        } catch (e) {
+          err = (err || "") + `pid=${pid}: ${e.message}; `;
+        }
+        // 不需要等子进程退出事件，SIGKILL 不可拦截
+        done++;
+      }
+      resolve({ pids: killed, error: err });
+    });
+  });
+}
+
+// 2026-09-07 老豆要求修复：拉一轮服务并探测健康
+// 用于 health 工具里"模型未就绪"路径的复用函数
+async function relaunchService(port, maxWait = 30) {
+  const script = `import sys; sys.path.insert(0,'${path.resolve(__dirname, "../scripts")}'); ` +
+    `from service_lifecycle import ensure_service_up; ` +
+    `ok=ensure_service_up(${port}, max_wait=${maxWait}); print('ok' if ok else 'fail')`;
+  try {
+    await new Promise((res) => {
+      const child = spawn(PYTHON_BIN, ["-c", script], { stdio: ["ignore", "pipe", "pipe"] });
+      let s = "";
+      child.stdout.on("data", (d) => (s += d.toString()));
+      child.on("close", (c) => res({ code: c, out: s.trim() }));
+    });
+    // 拉完后探测一次
+    const probe = await probeModelReady(port, 3000);
+    return { ready: probe.ready, status: probe.status, error: probe.error };
+  } catch (e) {
+    return { ready: false, status: null, error: String(e.message || e) };
+  }
+}
+
 // 轮询端口就绪，带超时
 async function waitForPort(port, timeoutMs = 30000) {
   const interval = 500;
@@ -908,11 +983,70 @@ export default definePluginEntry({
           if (!includeScenario) layers = layers.filter(l => l !== "L2");
         }
         const layersArg = layers.join(",");
-        const res = await runPython([
-          "recall", "--query", String(params.query), "--top-k", String(topK),
-        ], { env: buildEnv(config), script: path.resolve(__dirname, "../scripts/recall_4layer.py") });
+        let res;
+        try {
+          // 2026-09-07 老豆要求修复：兜底超时 30s
+          // recall_4layer.py 内部已加了服务拉起机制，这个超时是最终防线
+          // 超时后返回明确错误，LLM 调 health 拉起服务后重试
+          res = await runPython([
+            "recall", "--query", String(params.query), "--top-k", String(topK),
+          ], {
+            env: buildEnv(config),
+            script: path.resolve(__dirname, "../scripts/recall_4layer.py"),
+            timeoutMs: 30000,
+          });
+        } catch (err) {
+          // runPython 抛错（服务未启动 / 端口连不上 / Python 脚本崩溃等）
+          const errMsg = (err && err.message) ? err.message : String(err);
+          const payload = {
+            ok: false,
+            error: "service_unavailable",
+            message: `Memory OS 召回失败，服务可能未启动或连接异常: ${errMsg}`,
+            suggested_next: "请调用 memory_os_health 工具检查 4 个端口（Neo4j 7687 / Qdrant 6333 / Embed 8765 / Reranker 8877），必要时自动拉起挂掉的服务，然后重试本工具。",
+            hint: "形成闭环：recall 失败 → health 自检 → 拉起服务 → 重试 recall。",
+          };
+          return { content: [{ type: "text", text: JSON.stringify(payload) }] };
+        }
         let payload;
-        try { payload = JSON.parse(res.stdout.trim()); } catch { payload = { raw: res.stdout.slice(-500) }; }
+        try {
+          payload = JSON.parse(res.stdout.trim());
+        } catch (parseErr) {
+          // Python 脚本输出了非 JSON（崩溃、超时、栈跟踪等）
+          const stderrTail = (res.stderr || "").slice(-500);
+          const stdoutTail = (res.stdout || "").slice(-500);
+          payload = {
+            ok: false,
+            error: "invalid_response",
+            message: "recall_4layer.py 输出非 JSON，召回脚本可能崩溃或超时",
+            suggested_next: "请调用 memory_os_health 工具检查服务状态，必要时拉起后重试。",
+            stdout_tail: stdoutTail,
+            stderr_tail: stderrTail,
+          };
+          return { content: [{ type: "text", text: JSON.stringify(payload) }] };
+        }
+        // payload 解析成功，但需要检查是否是脚本主动返回的错误
+        if (payload && payload.ok === false) {
+          // 脚本内部已经检测到错误（比如服务未启动），补一层 suggested_next
+          payload.suggested_next = payload.suggested_next
+            || "请调用 memory_os_health 工具检查 4 个端口状态，必要时自动拉起服务，然后重试本工具。";
+          return { content: [{ type: "text", text: JSON.stringify(payload) }] };
+        }
+        // 检查是否真的召回到了内容（4 层都没结果也要明确反馈，避免静默成功）
+        const layerResults = payload && payload.layers ? payload.layers : {};
+        const layerKeys = Object.keys(layerResults);
+        const totalHits = layerKeys.reduce((sum, k) => {
+          const items = layerResults[k];
+          return sum + (Array.isArray(items) ? items.length : 0);
+        }, 0);
+        if (totalHits === 0 && layerKeys.length > 0) {
+          // 服务正常但确实没数据
+          payload.ok = true;
+          payload.empty = true;
+          payload.message = `召回完成，但 4 层记忆中没有与 query "${params.query}" 相关的内容（layers: ${layerKeys.join(",")}，共 0 条）。如需写入新记忆，请用 memory_os_ingest。`;
+        } else if (totalHits > 0) {
+          payload.ok = true;
+          payload.empty = false;
+        }
         return { content: [{ type: "text", text: JSON.stringify(payload) }] };
       },
     });
@@ -1111,13 +1245,14 @@ export default definePluginEntry({
       async execute(_id, params) {
         const deep = !!params.deep;
 
-        // 快速模式：只查 4 个端口，挂了的服务自动拉起
+        // 快速模式：查 4 个端口 + embed/reranker 模型是否真就绪，挂了的服务自动拉起
         const portChecks = [];
+        const modelChecks = {};
         for (const [name, port] of Object.entries(SERVICE_PORTS)) {
           const t0 = Date.now();
           let up = await checkService(name, port).catch(() => false);
 
-          // 挂了：尝试自动拉起
+          // 端口挂了：尝试自动拉起
           if (!up) {
             console.log(`[memory-os] ${name}(${port}) down，尝试拉起...`);
             try {
@@ -1133,7 +1268,7 @@ export default definePluginEntry({
                 // embed / reranker：调 service_lifecycle.ensure_service_up
                 const script = `import sys; sys.path.insert(0,'${path.resolve(__dirname, "../scripts")}'); ` +
                   `from service_lifecycle import ensure_service_up; ` +
-                  `ok=ensure_service_up(${port}); print('ok' if ok else 'fail')`;
+                  `ok=ensure_service_up(${port}, max_wait=30); print('ok' if ok else 'fail')`;
                 const out = await new Promise((res) => {
                   const child = spawn(PYTHON_BIN, ["-c", script], { stdio: ["ignore", "pipe", "pipe"] });
                   let s = "";
@@ -1145,8 +1280,45 @@ export default definePluginEntry({
             } catch (e) {
               console.error(`[memory-os] ${name} 自动拉起出错: ${e}`);
             }
-            // 重新检测
+            // 重新检测端口
             up = await checkService(name, port).catch(() => false);
+          }
+
+          // 2026-09-07 老豆要求修复：端口 up ≠ 模型就绪
+          // embed / reranker 额外探 /health 端点，验证模型是否热加载完
+          if (up && (name === "embed" || name === "reranker")) {
+            const probe = await probeModelReady(port, 3000);
+            modelChecks[name] = {
+              port,
+              ready: probe.ready,
+              http_status: probe.status || null,
+              error: probe.error || null,
+            };
+            // 模型未就绪：拉起后重探（最多 1 次）
+            if (!probe.ready) {
+              console.log(`[memory-os] ${name} 端口 up 但模型未就绪，先拉一遍...`);
+              const firstTry = await relaunchService(port);
+              if (firstTry.ready) {
+                modelChecks[name].ready = true;
+                modelChecks[name].http_status = firstTry.status;
+                modelChecks[name].error = null;
+                modelChecks[name].relaunched = true;
+              } else {
+                // 第一轮拉不起来：kill -9 旧进程 → 等端口释放 → 再拉一轮
+                console.log(`[memory-os] ${name} 第一轮拉不起来，强杀旧进程后重拉...`);
+                const killed = await killPortProcess(port);
+                modelChecks[name].kill9_pids = killed.pids;
+                modelChecks[name].kill9_error = killed.error || null;
+                // 等 2s 让端口从 TIME_WAIT 释放
+                await new Promise((r) => setTimeout(r, 2000));
+                // 第二轮（最终一轮）：强制重拉
+                const secondTry = await relaunchService(port);
+                modelChecks[name].ready = secondTry.ready;
+                modelChecks[name].http_status = secondTry.status;
+                modelChecks[name].error = secondTry.error;
+                modelChecks[name].final_relaunched = true;
+              }
+            }
           }
 
           portChecks.push({
@@ -1158,11 +1330,22 @@ export default definePluginEntry({
           });
         }
 
+        // all_up = 端口全 up 且 embed/reranker 模型都就绪
+        const allPortsUp = portChecks.every((c) => c.up);
+        const allModelsReady = Object.values(modelChecks).every((m) => m.ready);
+        const all_up = allPortsUp && allModelsReady;
+
         const result = {
           mode: deep ? "deep" : "fast",
           timestamp: new Date().toISOString(),
           ports: portChecks,
-          all_up: portChecks.every((c) => c.up),
+          models_ready: modelChecks,
+          all_up,
+          summary: all_up
+            ? "所有服务端口 + embed/reranker 模型都已就绪"
+            : (allPortsUp
+                ? `端口都在但模型未就绪: ${Object.entries(modelChecks).filter(([_, v]) => !v.ready).map(([k, _]) => k).join(", ")}`
+                : `端口未都就绪: ${portChecks.filter((c) => !c.up).map((c) => c.name).join(", ")}`),
         };
 
         if (deep) {
@@ -1190,6 +1373,7 @@ export default definePluginEntry({
             mode: deep ? "deep" : "fast",
             all_up: result.all_up,
             down: portChecks.filter((c) => !c.up).map((c) => c.name),
+            models_not_ready: Object.entries(modelChecks).filter(([_, v]) => !v.ready).map(([k, _]) => k),
           });
         } catch {}
 

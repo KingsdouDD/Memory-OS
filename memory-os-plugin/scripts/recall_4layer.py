@@ -38,16 +38,15 @@ from recall_config import RecallConfig
 RERANKER_URL = "http://127.0.0.1:8877/rerank"
 
 
-def _rerank_via_http(query, candidates, top_k=5, timeout=30):
+def _rerank_via_http(query, candidates, top_k=5, timeout=10):
     """调 reranker HTTP 服务做精排，返回 (index, score) 列表。
 
-    进程 dead 时自动拉起服务（不常驻，只在使用时拉）。
+    关键设计（2026-09-07 老豆要求修复）：
+      - 不再重复调 ensure_service_up：服务就绪由 recall_4layer 入口统一负责
+      - timeout 从 30s 降到 10s：模型加载卡死时快速失败，recall 走降级路径
+      - 失败返回 []：让主流程能继续出结果，绝不因 reranker 卡死整个 recall
     """
-    from service_lifecycle import ensure_service_up
-    try:
-        ensure_service_up(8877, max_wait=90)
-    except Exception as e:
-        print(f"[warn] ensure reranker up failed: {e}", file=sys.stderr)
+    if not candidates:
         return []
     import urllib.request
     payload = json.dumps({"query": query, "candidates": candidates, "top_k": top_k}).encode("utf-8")
@@ -540,10 +539,13 @@ def recall_4layer(query, top_k=5, layers=None):
       }
     """
     # 进入召回前，主动拉起依赖的 embed/reranker 服务（idle 超时后进程可能已 dead）
+    # 2026-09-07 老豆要求修复：max_wait 从 90 降到 30
+    # 原因：端口起来一般 5-10s，模型加载是服务内部的事，等再久也是服务内部 race
+    # 真等不了时直接返回失败让上层走降级路径，不要让用户干等
     try:
         from service_lifecycle import ensure_service_up
-        ensure_service_up(8765, max_wait=90)  # embed
-        ensure_service_up(8877, max_wait=90)  # reranker
+        ensure_service_up(8765, max_wait=30)  # embed
+        ensure_service_up(8877, max_wait=30)  # reranker
     except Exception as e:
         print(f"[warn] ensure service up failed at recall entry: {e}", file=sys.stderr)
     if layers is None:
