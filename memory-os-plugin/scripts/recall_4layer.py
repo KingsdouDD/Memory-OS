@@ -48,7 +48,7 @@ RERANKER_URL = "http://127.0.0.1:8877/rerank"
 def _rerank_via_http(query, candidates, top_k=5, timeout=10):
     """调 reranker HTTP 服务做精排，返回 (index, score) 列表。
 
-    关键设计（2026-09-07 老豆要求修复）：
+   
       - 不再重复调 ensure_service_up：服务就绪由 recall_4layer 入口统一负责
       - timeout 从 30s 降到 10s：模型加载卡死时快速失败，recall 走降级路径
       - 失败返回 []：让主流程能继续出结果，绝不因 reranker 卡死整个 recall
@@ -533,7 +533,7 @@ def recall_4layer(query, top_k=5, layers=None):
     Returns:
       {
         "query": str,
-        # 老豆 2026-09-08 要求修复：L3/L2 只用作召回辅助（提取 entities/scenario_ids 给 L1 filter），
+        #  2026-09-08 要求修复：L3/L2 只用作召回辅助（提取 entities/scenario_ids 给 L1 filter），
         # 不进最终输出。L1 atom 才是用户要的“原子记忆”。
         # 为保持调试可见性，L3/L2 明细仍保留在响应里但加 _aux 前缀，提醒上层不要注入。
         "_aux_persona": [...],    # L3 召回明细（仅调试用，不注入提示词）
@@ -549,7 +549,7 @@ def recall_4layer(query, top_k=5, layers=None):
       }
     """
     # 进入召回前，主动拉起依赖的 embed/reranker 服务（idle 超时后进程可能已 dead）
-    # 2026-09-07 老豆要求修复：max_wait 从 90 降到 30
+    # 2026-09-07 修复：max_wait 从 90 降到 30
     # 原因：端口起来一般 5-10s，模型加载是服务内部的事，等再久也是服务内部 race
     # 真等不了时直接返回失败让上层走降级路径，不要让用户干等
     try:
@@ -653,7 +653,7 @@ def recall_4layer(query, top_k=5, layers=None):
                 graph_prf_triggered = True
 
     # ── Step 4: 向量召回（无条件，单一路径，top 20，水位 0.62）────────────
-    # 老豆 2026-09-07 设计意图：
+    #  2026-09-07 设计意图：
     #   - 不再有"Path A / Path B"分支（这是我之前臆想的）
     #   - 统一走纯向量召回，entity filter 不再是硬过滤（删）
     #   - top_k = 20（在 0.62 水位基础上保证候选充足）
@@ -681,7 +681,7 @@ def recall_4layer(query, top_k=5, layers=None):
                         resp = client.query_points(
                             collection_name=coll,
                             query=vec,
-                            limit=20,                        # 老豆要求 top 20
+                            limit=20,                        # 要求 top 20
                             score_threshold=0.62,            # 水位 0.62 不动
                         )
                         for hit in resp.points:
@@ -698,15 +698,15 @@ def recall_4layer(query, top_k=5, layers=None):
                 print(f"[warn] vec recall failed: {e}", file=sys.stderr)
                 items = []
 
-            # entity overlap 重排保留（老豆要求 entity overlap 作为加权信号，不是硬过滤）
+            # entity overlap 重排保留（要求 entity overlap 作为加权信号，不是硬过滤）
             if filter_entities and items:
                 items = _rerank_by_entity_overlap(items, filter_entities)
                 items.sort(key=lambda x: -x.get("combined_score", x.get("score", 0)))
 
-            atom = items[:20]   # 老豆要求 top 20
+            atom = items[:20]   # 要求 top 20
 
     # ── Step 5: 已删除（与 Step 4 entity overlap 重排重复）──────────
-    # 老豆 2026-09-07 设计：保留 Step 4 里的 entity overlap 重排一次即可
+    # 2026-09-07 设计：保留 Step 4 里的 entity overlap 重排一次即可
 
     # ── Step 6: Association Expansion（联想记忆）────────────────────
     # 如果 L3/L2 有召回 entities → 用 filter_entities 启动联想
@@ -777,8 +777,8 @@ def recall_4layer(query, top_k=5, layers=None):
             m["recall_reason"] = "直接匹配"
 
     merged_atom = list(atom)
-    # 老豆 2026-09-07 修复：Neo4j 联想扩散的候选不再进 merged_atom
-    # 原因：联想扩散会从实体（如“外婆”）跳到与 query 语义无关的其他实体（“老豆/用户/小橘子”）
+    #  2026-09-07 修复：Neo4j 联想扩散的候选不再进 merged_atom
+    # 原因：联想扩散会从实体跳到与 query 语义无关的其他实体
     #       这些候选跟用户实际想问的东西不相关，进了最终输出会污染召回
     # 保留功能： Neo4j 还能给直接命中项加分（上面 Step 3 PRF + Step 4 entity overlap 重排）
     # 所以下面这段不再把 assoc_candidates 接入 merged_atom
@@ -806,7 +806,7 @@ def recall_4layer(query, top_k=5, layers=None):
                 4,
             )
 
-    # 老豆 2026-09-07 设计：删除 0.55 rerank score 硬过滤
+    #  2026-09-07 设计：删除 0.55 rerank score 硬过滤
     # 重排后直接取 top 5（top_k）作为最终输出，不再做硬过滤
     # 原因：Reranker 对情感化 query + 事实性 memory 的打分天然偏低
     #       0.55 水位会把合理命中都砍掉，导致 memory_os_recall 返回 0 条
@@ -826,7 +826,7 @@ def recall_4layer(query, top_k=5, layers=None):
     return {
         "query": query,
         "layers": layers,
-        # 老豆 2026-09-08：L3/L2 只做 filter，不进最终输出
+        # 2026-09-08：L3/L2 只做 filter，不进最终输出
         "_aux_persona": persona,
         "_aux_scenario": scenario,
         "atom": merged_atom,
@@ -920,7 +920,7 @@ if __name__ == "__main__":
             result = recall_for_hook(args.query, top_k=args.top_k)
             print(json.dumps(result, ensure_ascii=False))
         else:
-            # 老豆 2026-09-07 修复：CLI 模式要保留 memories 字段
+            # 2026-09-07 修复：CLI 模式要保留 memories 字段
             # 原因：OpenClaw 工具读 payload.memories 判断是否空
             # 原代码过滤掉了，导致有数据时也返回 empty:true
             result = recall_4layer(args.query, top_k=args.top_k)
