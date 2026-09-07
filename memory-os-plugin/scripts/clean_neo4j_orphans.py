@@ -224,7 +224,7 @@ def main():
     driver.close()
 
     out_path.write_text("".join(lines), encoding="utf-8")
-    print(f"\n✅ 清理完成 → {out_path}")
+    print(f"\n清理完成 → {out_path}")
     print("".join(lines[:20]))
 
 
