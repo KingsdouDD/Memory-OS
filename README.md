@@ -5,230 +5,230 @@
 [![Node.js](https://img.shields.io/badge/node-V26%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![Python](https://img.shields.io/badge/python-3.14-3776ab?logo=python&logoColor=white)](https://www.python.org/)
 
-> **Neo4j + Qdrant 混合长期记忆系统**，4 层记忆架构（L0/L1/L2/L3），为 AI Agent 提供持久化上下文记忆能力。
+> **Neo4j + Qdrant hybrid long-term memory system** with a 4-layer architecture (L0/L1/L2/L3), giving AI Agents persistent contextual memory.
 >
-> 主动召回 / 联想扩散 / 两阶段安全更新 / 按状态分流。
+> Proactive recall · Associative expansion · Two-phase safe updates · Status-based routing.
 
 ---
 
-## 一句话定位
+## Elevator Pitch
 
-把 AI 的"记忆"从模糊的上下文窗口，升级成**可精确写入、语义召回、关系推理、主动联想**的长期记忆系统。
-
----
-
-## 核心特色
-
-### 🧠 4 层记忆分层架构
-
-| 层 | 名称 | 内容 | 召回优先级 |
-|----|------|------|------------|
-| **L3** | 长期画像 | 跨场景稳定认知（性格、习惯、偏好、关系） | 🔴 最高 |
-| **L2** | 场景记忆 | 完整历史场景（事件、项目、关系） | 🟠 高 |
-| **L1** | 原子事实 | 最小独立知识单元（fact / event / preference / routine / goal …） | 🟡 中 |
-| **L0** | 原始对话 | 原始对话原文（托底证据） | ⚪ 最低 |
-
-层级越高，允许的推断越少。L1 必须独立可读，L2 必须可恢复历史场景，L3 必须跨场景稳定。
-
-### 🔗 混合召回引擎
-
-- **向量检索**（Qdrant ANN）× **全文检索**（BM25 + jieba）× **知识图谱**（Neo4j）三路并行
-- **RRF 融合** + **重要性加权**（0.5×~1.5×）+ **时间衰减**（180 天半衰期）+ **图命中 boost**（×1.3）
-- **联想扩散**（Association Expansion）：Neo4j 多跳扩散 → 拼接 expansion vector → Qdrant 联想候选 → 综合打分
-- **一次 Reranker 调用**完成精排，从 2次/Query → 1次/Query
-
-### 🏃 主动记忆注入
-
-- **Hook 自动召回**：`before_prompt_build` 触发，无需 LLM 显式调用
-- **门控过滤**（`recall_gate.py`）：长度 < 7 字 / > 300 字 / 纯情绪词 / 粗口 / 重复字符 → 跳过
-- **同会话 Query 去重**：md5 缓存，避免重复召回
-- **注入格式**：包裹成"【以下是你和用户之间的共同记忆】"，引导 LLM 自然回忆而非外部资料感
-
-### 🔄 灵活的记忆管理
-
-- **6 个 MCP 工具**：ingest / recall / update / delete / health / **extract_runtime**
-- **两阶段更新/删除**（token 保护，30 分钟 TTL，存 HOME 目录）+ **快捷模式**（直接指定 PID）
-- **按状态分流**：
-  - `completed` → 写入 Memory-OS（永久）
-  - `ongoing / stalled` → 写入运行时临时文件（按 agent 分文件 + 多任务增量衔接）
-
-### 🛠 本地优先 / 性能优异
-
-- Embedding / Reranker 跑在**本地 GGUF 模型**（Metal 加速），不依赖云 API
-- Embed / Reranker daemon **按需自动 spawn**：`subprocess.Popen` 拉起（`start_new_session=False`，父进程退出时子进程跟着退出），避免常驻僵尸
-- 11 项启动自检改为**后台执行**（1 秒延迟），不再阻塞插件加载（延迟从 60s+ → 0）
+Turn AI "memory" from a vague context window into a **precisely writable, semantically searchable, relationship-reasoning, proactively associative** long-term memory system.
 
 ---
 
-## 系统架构
+## Core Features
+
+### 🧠 4-Layer Memory Hierarchy
+
+| Layer | Name | Content | Recall Priority |
+|-------|------|---------|----------------|
+| **L3** | Persona | Cross-scenario stable traits (personality, habits, preferences, relationships) | 🔴 Highest |
+| **L2** | Scenario | Complete historical scenes (events, projects, relationships) | 🟠 High |
+| **L1** | Atom | Smallest independent knowledge units (fact / event / preference / routine / goal …) | 🟡 Medium |
+| **L0** | Raw Dialog | Original conversation transcript (fallback evidence) | ⚪ Lowest |
+
+Higher layers allow less inference. L1 must be independently readable. L2 must recover historical scenes. L3 must be cross-scenario stable.
+
+### 🔗 Hybrid Recall Engine
+
+- **Vector search** (Qdrant ANN) × **Full-text search** (BM25 + jieba) × **Knowledge graph** (Neo4j) — all three run in parallel
+- **RRF fusion** + **importance weighting** (0.5×~1.5×) + **temporal decay** (180-day half-life) + **graph hit boost** (×1.3)
+- **Associative Expansion**: Neo4j multi-hop expansion → concat expansion vector → Qdrant associative candidates → comprehensive scoring
+- **One Reranker call** per query (reduced from 2 calls/query → 1)
+
+### 🏃 Proactive Memory Injection
+
+- **Hook-triggered recall**: `before_prompt_build` fires before every LLM call
+- **Gate filtering** (`recall_gate.py`): length < 7 chars / > 300 chars / pure emotional words / profanity / repetitive chars → skip
+- **Same-session query deduplication**: md5 cache prevents redundant recalls
+- **Injection format**: wrapped as "【以下是你和用户之间的共同记忆】", guiding the LLM to recall naturally rather than cite external data
+
+### 🔄 Flexible Memory Management
+
+- **6 MCP tools**: ingest / recall / update / delete / health / **extract_runtime**
+- **Two-phase update/delete** (token protection, 30-min TTL, stored in HOME dir) + **shortcut mode** (direct PID)
+- **Status-based routing**:
+  - `completed` → write to Memory-OS (permanent)
+  - `ongoing / stalled` → write to runtime temp files (per-agent files + incremental append)
+
+### 🛠 Local-First / High Performance
+
+- Embedding / Reranker run on **local GGUF models** (Metal-accelerated), no cloud API dependency
+- Embed / Reranker daemon **spawns on demand**: `subprocess.Popen`拉起（`start_new_session=False` — child dies when parent exits), no zombie daemons
+- 11-item startup self-check moved to **background execution** (1-second delay), no longer blocks plugin load (latency: 60s+ → 0)
+
+---
+
+## Architecture
 
 ```
-用户输入
+User Input
    │
    ▼
 ┌──────────────────────────────────────┐
-│  Hook Gate（recall_gate.py）           │  长度 / 情绪 / 粗口过滤
-│  文本 < 7 字 / > 300 字 → 跳过         │
-│  纯情绪词（嗯/好的/ok/继续） → 跳过    │
+│  Hook Gate（recall_gate.py）           │  Length / emotion / profanity filter
+│  Text < 7 chars / > 300 chars → skip  │
+│  Pure filler（嗯/好的/ok/继续） → skip │
 └──────────────────────────────────────┘
    │ Pass
    ▼
 ┌──────────────────────────────────────┐
 │  4-Layer Recall（recall_4layer.py）   │
 │                                      │
-│  Step 1: L3 召回（persona）          │  → 提取 entities
-│  Step 2: L2 召回（scenario）          │  → 提取 entities + ids
-│  Step 2.5: jieba 实体补充             │
-│  Step 3: Graph PRF（Neo4j 1-hop）     │
-│  Step 4: L1 主召回（vec+BM25+Graph）  │  三路并行 → RRF 融合
-│  Step 5: Pre-filter（entity overlap） │
-│  Step 6: Association Expansion        │  ← Neo4j 多跳扩散 + Qdrant 联想
-│  → 合并去重 + 统一 Reranker × 1       │
+│  Step 1: L3 recall（persona）        │  → Extract entities
+│  Step 2: L2 recall（scenario）        │  → Extract entities + ids
+│  Step 2.5: jieba entity supplement   │
+│  Step 3: Graph PRF（Neo4j 1-hop）    │
+│  Step 4: L1 main recall（vec+BM25+Graph）│  Three paths → RRF fusion
+│  Step 5: Pre-filter（entity overlap）│
+│  Step 6: Association Expansion        │  ← Neo4j multi-hop + Qdrant assoc
+│  → Dedupe + single Reranker × 1      │
 │  → Final Top-K                       │
 └──────────────────────────────────────┘
    │
    ▼
 ┌──────────────────────────────────────┐
-│  Memory Injection（src/index.js）      │  prepend 到 system prompt
+│  Memory Injection（src/index.js）     │  Prepend to system prompt
 │  "【以下是你和用户之间的共同记忆】"     │
 └──────────────────────────────────────┘
    │
    ▼
-  LLM 输出（含注入记忆）
+  LLM Output (with injected memories)
 ```
 
 ---
 
-## 仓库结构
+## Repository Structure
 
 ```
-memory-os/                          # ← 本仓库（运行时 + 文档 + 配置）
-├── memory-os-plugin/               #    OpenClaw 插件源代码
-│   ├── src/index.js                 #      插件入口：Hook + 6 个 MCP 工具
-│   ├── scripts/                    #      核心脚本（召回 / 写入 / 守护进程）
-│   ├── prompts/                    #      LLM 抽取规范
+memory-os/                          # ← This repo (runtime + docs + config)
+├── memory-os-plugin/               #    OpenClaw plugin source
+│   ├── src/index.js                #      Plugin entry: Hook + 6 MCP tools
+│   ├── scripts/                    #      Core scripts (recall / write / daemons)
+│   ├── prompts/                    #      LLM extraction specs
 │   ├── openclaw.plugin.json
-│   ├── README.md                   #      插件专属文档（hooks / 实现细节）
-│   └── README_recall.md            #      召回流程详解（参数表 / 6 Steps）
-├── models/                         # 本地 GGUF 模型（BGE-M3 / Qwen3-Reranker）
-├── neo4j/                          # Neo4j 数据目录
-├── qdrant/                         # Qdrant 数据目录
-├── venv/                           # Python 虚拟环境
-├── tokens/                         # update/delete token（TTL 30 min）
-├── config/                         # Neo4j / Qdrant 配置
-├── logs/                           # 运行时日志
+│   ├── README.md                   #      Plugin-specific docs (hooks / impl details)
+│   └── README_recall.md            #      Recall flow deep-dive (6 Steps)
+├── models/                         # Local GGUF models (BGE-M3 / Qwen3-Reranker)
+├── neo4j/                          # Neo4j data directory
+├── qdrant/                         # Qdrant data directory
+├── venv/                           # Python virtual environment
+├── tokens/                         # update/delete tokens (TTL 30 min)
+├── config/                         # Neo4j / Qdrant config
+├── logs/                           # Runtime logs
 ├── dream-cron.sh                   # dream 摄取定时任务
-├── README.md                       # ← 你在这里（主页面）
+├── README.md                       # ← You are here (main page)
 ├── .gitattributes
 └── .gitignore
 ```
 
 ---
 
-## 6 个 MCP 工具
+## 6 MCP Tools
 
-| 工具 | 用途 | 调用示例 |
-|------|------|----------|
-| `memory_os_ingest` | 存入永久记忆（4 层 JSON） | `memory_os_ingest({ memory_json: '{"l0":...,"l1":{"kos":[...]},"l2":...,"l3":...}' })` |
-| `memory_os_recall` | 查询记忆（4 层融合） | `memory_os_recall({ query: "...", top_k: 5, layers: "L3,L2,L1" })` |
-| `memory_os_update` | 更新记忆（追加不是覆盖） | `memory_os_update({ target_pid: "...", target_layer: "L3", memory_json: "...", confirm: true })` |
-| `memory_os_delete` | 删除记忆（物理删除） | `memory_os_delete({ target_pid: "...", target_layer: "L3", confirm: true })` |
-| `memory_os_health` | 服务健康检查 | `memory_os_health({ deep: false })` |
-| `memory_os_extract_runtime` | 运行时临时记忆（按状态分流） | `memory_os_extract_runtime({ memory_json: "...", status: "completed" })` |
+| Tool | Purpose | Call Example |
+|------|---------|--------------|
+| `memory_os_ingest` | Store permanent memory (4-layer JSON) | `memory_os_ingest({ memory_json: '{"l0":...,"l1":{"kos":[...]},"l2":...,"l3":...}' })` |
+| `memory_os_recall` | Query memories (4-layer fusion) | `memory_os_recall({ query: "...", top_k: 5, layers: "L3,L2,L1" })` |
+| `memory_os_update` | Update memory (append, not overwrite) | `memory_os_update({ target_pid: "...", target_layer: "L3", memory_json: "...", confirm: true })` |
+| `memory_os_delete` | Delete memory (physical) | `memory_os_delete({ target_pid: "...", target_layer: "L3", confirm: true })` |
+| `memory_os_health` | Service health check | `memory_os_health({ deep: false })` |
+| `memory_os_extract_runtime` | Runtime temp memory (status-based routing) | `memory_os_extract_runtime({ memory_json: "...", status: "completed" })` |
 
-> 📖 详细 API、参数、所有调用模式 → 见 [`memory-os-plugin/README.md`](memory-os-plugin/README.md)
+> 📖 Detailed API, parameters, all call patterns → see [`memory-os-plugin/README.md`](memory-os-plugin/README.md)
 
 ---
 
-## 安装
+## Installation
 
-### 1. 依赖服务
+### 1. Dependencies
 
-| 服务 | 端口 | 启动方式 |
-|------|------|----------|
+| Service | Ports | How to start |
+|---------|-------|--------------|
 | **Neo4j** | 7474 / 7687 | `brew services start neo4j` |
 | **Qdrant** | 6333 / 6334 | `brew services start qdrant` |
-| **Embed Daemon** | 8765 | **自动 spawn**（端口无人监听时） |
-| **Reranker Daemon** | 8877 | **自动 spawn**（端口无人监听时） |
+| **Embed Daemon** | 8765 | **Auto-spawned** (when port is not listened) |
+| **Reranker Daemon** | 8877 | **Auto-spawned** (when port is not listened) |
 
-> **架构说明（2026-09-06 重构）**：Embed / Reranker daemon 改用 `subprocess.Popen` 直接 spawn（不再依赖 launchd）。`start_new_session=False` 让父进程退出时子进程跟着退出，避免 daemon 变成常驻僵尸。Neo4j / Qdrant 仍由 brew 管理（需要常驻）。
+> **Architecture note (refactored 2026-09-06)**: Embed / Reranker daemons now use `subprocess.Popen` directly (no more launchd). `start_new_session=False` means child dies with parent — no zombie daemons. Neo4j / Qdrant are still managed by brew (they need to stay alive).
 
-### 2. 环境变量
+### 2. Environment Variables
 
-在 `memory-os-plugin/` 创建 `.env`（或在 shell 里 `export`）：
+Create `.env` in `memory-os-plugin/` (or `export` in shell):
 
 ```bash
-# 必填：连接配置
+# Required: connection config
 MEMORY_OS_NEO4J_URI=bolt://127.0.0.1:7687
 MEMORY_OS_NEO4J_USER=neo4j
-MEMORY_OS_NEO4J_PASSWORD=***           # Neo4j 密码（必填，源码里不再有默认值）
+MEMORY_OS_NEO4J_PASSWORD=***           # Neo4j password (required, no default in source)
 MEMORY_OS_QDRANT_HOST=127.0.0.1
 MEMORY_OS_QDRANT_PORT=6333
 MEMORY_OS_EMBEDDING_MODEL=~/.openclaw/workspace/memory-os/models/bge-m3-Q8_0.gguf
 
-# 可选：调试 / 通知
+# Optional: debug / notifications
 MEMORY_OS_HOOK_TRACE_ENABLED=1
-QQ_OWNER_OPENID=qqbot:c2c:<your_openid>   # dream-cron.sh 通知用，需替换为你的 QQ openid
+QQ_OWNER_OPENID=qqbot:c2c:<your_openid>   # dream-cron.sh notifications; replace with your QQ openid
 ```
 
-> **2026-09-06 安全说明**：源码里**不再硬编码** Neo4j 密码和 QQ openid，全部走环境变量。  
-> - Neo4j 密码：`MEMORY_OS_NEO4J_PASSWORD`（必填，源码默认 `'openclaw'` 仅本地兜底）
-> - QQ openid：`QQ_OWNER_OPENID`（仅 `dream-cron.sh` 需要）
+> **Security note (2026-09-06)**: Source code no longer hardcodes Neo4j password or QQ openid — everything goes through env vars.
+> - Neo4j password: `MEMORY_OS_NEO4J_PASSWORD` (required; source defaults to `'openclaw'` only as local fallback)
+> - QQ openid: `QQ_OWNER_OPENID` (only needed by `dream-cron.sh`)
 
-### 3. Embedding / Reranker 模型
+### 3. Embedding / Reranker Models
 
-| 服务 | 模型 | 路径 |
-|------|------|------|
-| Embed | BGE-M3（GGUF / MLX） | `~/.openclaw/workspace/memory-os/models/bge-m3-mlx-8bit` |
+| Service | Model | Path |
+|---------|-------|------|
+| Embed | BGE-M3 (GGUF / MLX) | `~/.openclaw/workspace/memory-os/models/bge-m3-mlx-8bit` |
 | Reranker | Qwen3-Reranker-0.6B | `~/.openclaw/workspace/memory-os/models/Qwen3-Reranker-0.6B-4bit` |
 
 ---
 
-## 关键设计决策
+## Key Design Decisions
 
-### PID 格式：标准 UUID
+### PID Format: Standard UUID
 
-L2/L3 的 PID 从整数 md5 改为标准 UUID（`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`），避免与 Neo4j Long 上限冲突。
+L2/L3 PIDs changed from integer md5 to standard UUID (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`), avoiding Neo4j Long overflow.
 
-### 写入是追加，不是覆盖
+### Writes Are Append, Not Overwrite
 
-L0-L3 长文本（summary）在更新时用 ` | ` 拼接追加。Neo4j 写新关系（MERGE），旧关系保留。
+L0-L3 long text (summary) is appended with ` | ` on update. Neo4j writes new relationships (MERGE), old ones are preserved.
 
-### 删除是物理删除
+### Deletes Are Physical
 
-Qdrant 点直接 delete，Neo4j 节点 DETACH DELETE，不做软删除。
+Qdrant points are directly deleted. Neo4j nodes are DETACH DELETED. No soft delete.
 
-### Association Expansion 联想扩散
+### Associative Expansion
 
-从种子实体出发，Neo4j 多跳扩散（默认 2 跳）→ Qdrant 向量搜索联想候选 → 综合打分（`overlap × 0.4 + depth_decay × 0.25 + importance × 0.2 + temporal × 0.15`）→ 统一 Reranker 精排。
+Starting from seed entities: Neo4j multi-hop expansion (default 2 hops) → concat expansion vector → Qdrant associative search → comprehensive scoring (`overlap × 0.4 + depth_decay × 0.25 + importance × 0.2 + temporal × 0.15`) → single Reranker ranking.
 
-### Token 安全
+### Token Safety
 
-Update / Delete 的两阶段 token 存放在 `~/.openclaw/workspace/memory-os/tokens/`，TTL 30 分钟，不受 `/tmp` 清理影响。
+Update / Delete two-phase tokens are stored in `~/.openclaw/workspace/memory-os/tokens/`, TTL 30 minutes, immune to `/tmp` cleanup.
 
-### Embed / Reranker 按需 spawn
+### Embed / Reranker On-Demand Spawn
 
-`subprocess.Popen` + `start_new_session=False`，父进程退出时子进程跟着退出，避免 daemon 变成常驻僵尸。
+`subprocess.Popen` + `start_new_session=False` — child dies when parent exits, no zombie daemons.
 
-### 启动自检后台化
+### Startup Self-Check Backgrounded
 
-插件 register 时不再同步跑 11 项自检（曾经最坏 60s+ 延迟），改 1 秒后后台 fire-and-forget。需要时调 `memory_os_health` 工具。
+Plugin registration no longer runs 11-item sync self-check (once took 60s+). Now fires 1 second later as fire-and-forget. Call `memory_os_health` tool when needed.
 
-### 运行时临时记忆按 agent 分文件
+### Runtime Temp Memory Per-Agent
 
-不同通道（QQ / 微信 / Telegram / subagent）的临时记忆写到不同文件，互不污染。老豆有多个微信账号，按 `openid` 区分。
+Different channels (QQ / WeChat / Telegram / subagent) write to separate temp files, no cross-pollution. Multiple WeChat accounts are distinguished by `openid`.
 
 ---
 
-## 文档索引
+## Documentation Index
 
-| 文档 | 内容 |
-|------|------|
-| [`README.md`](README.md) | 本文档：主页面、核心特色、架构、6 工具概览、安装 |
-| [`memory-os-plugin/README.md`](memory-os-plugin/README.md) | 插件专属：Hook 实现、注入格式、运维命令 |
-| [`memory-os-plugin/README_recall.md`](memory-os-plugin/README_recall.md) | 召回流程详解：6 Steps + Association Expansion + 参数表 |
-| [`memory-os-plugin/scripts/extract_prompt.md`](memory-os-plugin/scripts/extract_prompt.md) | LLM 抽取永久记忆的 4 层规范 |
-| [`memory-os-plugin/prompts/runtime_memory_extract.md`](memory-os-plugin/prompts/runtime_memory_extract.md) | LLM 抽取运行时临时记忆的规范（含快照窗口 + 按 agent 分文件） |
+| Document | Content |
+|----------|---------|
+| [`README.md`](README.md) | This page: main landing, core features, architecture, 6-tool overview, install |
+| [`memory-os-plugin/README.md`](memory-os-plugin/README.md) | Plugin-specific: Hook impl, injection format, ops commands |
+| [`memory-os-plugin/README_recall.md`](memory-os-plugin/README_recall.md) | Recall flow deep-dive: 6 Steps + Association Expansion + parameter table |
+| [`memory-os-plugin/scripts/extract_prompt.md`](memory-os-plugin/scripts/extract_prompt.md) | LLM extraction spec for permanent memory (4-layer) |
+| [`memory-os-plugin/prompts/runtime_memory_extract.md`](memory-os-plugin/prompts/runtime_memory_extract.md) | LLM extraction spec for runtime temp memory (snapshot window + per-agent files) |
 
 ---
 
