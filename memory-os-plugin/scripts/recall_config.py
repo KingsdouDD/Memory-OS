@@ -370,9 +370,9 @@ class RecallConfig:
     ASSOC_MAX_CANDIDATES = _env_int(
         "MEMORY_OS_ASSOC_MAX_CANDIDATES", 20
     )
-    # 是否启用 Association Expansion（0=关闭，1=开启）
+    # 是否启用 Association Expansion（0=关闭，1=开启）——开发者 2026-09-07 临时关掉排查召回干扰
     ASSOC_ENABLED = _env_int(
-        "MEMORY_OS_ASSOC_ENABLED", 1
+        "MEMORY_OS_ASSOC_ENABLED", 0
     )
 
     # ---- 自检 / dump ----

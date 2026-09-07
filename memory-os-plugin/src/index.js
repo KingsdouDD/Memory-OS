@@ -997,26 +997,28 @@ export default definePluginEntry({
         const layersArg = layers.join(",");
         let res;
         try {
-          // 2026-09-07 老豆要求修复：去掉超时限制
-          // 工具本身有错误反馈机制（ok:false + message + suggested_next），
-          // 硬超时会让冷启动场景（embed/reranker 模型首次加载需要 30s+）被杀掉。
-          // 让 recall 脚本自己跑完，成功/失败都返回。
+          // 2026-09-08 老豆要求修复：召回超过 30 秒硬超时，自动报错让模型调 health
+          // 之前是完全不限超时，embed/reranker 冷启动或服务卡住时模型会一直等，浪费时间。
+          // 30 秒足够正常召回完成；超时说明服务有问题，让模型自己决定调 health。
           res = await runPython([
             "recall", "--query", String(params.query), "--top-k", String(topK),
           ], {
             env: buildEnv(config),
             script: path.resolve(__dirname, "../scripts/recall_4layer.py"),
-            // timeoutMs 留 0 (不超时) — 跟 runPython 默认一致
+            timeoutMs: 30000,
           });
         } catch (err) {
-          // runPython 抛错（服务未启动 / 端口连不上 / Python 脚本崩溃等）
+          // runPython 抛错（服务未启动 / 端口连不上 / Python 脚本崩溃 / 超时等）
           const errMsg = (err && err.message) ? err.message : String(err);
+          const isTimeout = /timed out after \d+ms/i.test(errMsg);
           const payload = {
             ok: false,
-            error: "service_unavailable",
-            message: `Memory OS 召回失败，服务可能未启动或连接异常: ${errMsg}`,
+            error: isTimeout ? "recall_timeout" : "service_unavailable",
+            message: isTimeout
+              ? `Memory OS 召回超时（30 秒未返回），embed/reranker 模型可能冷启动中或卡死: ${errMsg}`
+              : `Memory OS 召回失败，服务可能未启动或连接异常: ${errMsg}`,
             suggested_next: "请调用 memory_os_health 工具检查 4 个端口（Neo4j 7687 / Qdrant 6333 / Embed 8765 / Reranker 8877），必要时自动拉起挂掉的服务，然后重试本工具。",
-            hint: "形成闭环：recall 失败 → health 自检 → 拉起服务 → 重试 recall。",
+            hint: "形成闭环：recall 失败/超时 → health 自检 → 拉起服务 → 重试 recall。",
           };
           return { content: [{ type: "text", text: JSON.stringify(payload) }] };
         }

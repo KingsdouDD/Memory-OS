@@ -207,12 +207,7 @@ Runtime 抽取不是新增 Memory Layer。
 {
   "l0": {
     "scene_summary": "当前 Scene 的简短摘要",
-    "source": "runtime:YYYY-MM-DD",
-    "snapshot_window": {
-      "from_iso": "对话起点 ISO timestamp（如 2026-09-06T11:00:00+08:00）",
-      "to_iso": "对话终点 ISO timestamp（如 2026-09-06T13:40:00+08:00）",
-      "duration_minutes": 160
-    }
+    "source": "runtime:YYYY-MM-DD"
   },
   "l1": {
     "kos": [
@@ -336,7 +331,7 @@ Runtime 抽取不是新增 Memory Layer。
 
 ## 7.5 时间戳铁律（避免"刻舟求剑"）
 
-`event_time.start`、`event_time.end`、`snapshot_window.from_iso`、`snapshot_window.to_iso` **必须是具体 ISO 8601 时间戳**，例如：
+`event_time.start`、`event_time.end` **必须是具体 ISO 8601 时间戳**，例如：
 
 ```
 2026-09-06T16:22:50+08:00
@@ -361,92 +356,17 @@ Runtime 抽取不是新增 Memory Layer。
 
 ---
 
-## 7.6 增量衔接（按 agent 分文件 + 多任务结构）
+## 7.6 临时文件格式（给抽取模型看的，不进永久库）
 
-### 7.6.1 按 agent 分文件（按通道类型分）
+临时记忆文件格式由外部调用方决定，Schema 规范只约束**抽取输出的 JSON 结构**。
 
-临时记忆**不是全局固定文件**，而是**每个 agent（通道/插件）一个文件**：
+以下字段仅用于抽取过程中的上下文追踪，写入长期数据库时应忽略：
 
-```
-${RUNTIME_ACTIVE_STATE_DIR}/${agent_id}.json
-```
+- `l0.snapshot_window`：抽取时间窗口，数据库不需要
+- `_meta`：文件自我描述，数据库不需要
+- `scenarios` 数组 / `task_id` / `current_task_id`：多任务追踪用，单次抽取只输出一个 scenario，数据库不需要
 
-- `RUNTIME_ACTIVE_STATE_DIR` 从 pluginConfig / runtime context 取，默认 `~/.openclaw/workspace/memory-os/memory-os-plugin/runtime_active_state/`
-- `agent_id` 从 `chat_id` 解析：按**通道/插件类型**派生（微信按用户 openid 区分，不合在一起）
-  - `qqbot:c2c:...` / `qqbot:direct:...` / `qqbot:guild:...` → `qq`
-  - `telegram:...` → `telegram`
-  - `discord:...` → `discord`
-  - `wechat:user_openid:...` / `weixin:user_openid:...` → `wechat_user_openid`（**用户有多个微信账号，按用户 openid 分文件**）
-  - `agent:gh-issues:...`（subagent）→ `gh-issues`
-  - 默认：`default`
-
-例：
-- QQ 通道所有对话 → `runtime_active_state/qq.json`
-- 微信用户 A → `runtime_active_state/wechat_userA.json`
-- 微信用户 B → `runtime_active_state/wechat_userB.json`（**两个微信账号不能合一个文件**）
-- Telegram 通道 → `runtime_active_state/telegram.json`
-- gh-issues subagent → `runtime_active_state/gh-issues.json`
-
-**为什么按通道/插件类型分文件**：不同通道的记忆互不污染；同一通道的对话都写同一个文件，跨用户/跨群连续；用户跑 gh-issues subagent 时不污染 QQ 记忆。
-
-**读写隔离**：读取旧临时文件时，**只读本 agent 的文件**（`${agent_id}.json`），**绝对不能读其他 agent 的文件**。用户是 QQ 通道就只能读 `qq.json`，不能读 `telegram.json` / `gh-issues.json` / 其他任何 agent 的临时文件。写入也一样：只写 `${agent_id}.json`。
-
-### 7.6.2 多任务结构
-
-临时记忆文件包含**所有进行中的任务**，不再是单任务结构：
-
-```json
-{
-  "l0": {
-    "scene_summary": "当前所有进行中任务的总体摘要",
-    "source": "runtime:YYYY-MM-DD",
-    "snapshot_window": { "from_iso": "...", "to_iso": "...", "duration_minutes": N }
-  },
-  "l1": {
-    "kos": []              // 所有任务的 KO 合集（含历史）
-  },
-  "l2": {
-    "scenarios": [         // 改为复数数组，不是单数 scenario
-      {
-        "title": "任务名称",
-        "task_id": "task_<uuid>",
-        "state": "active|ongoing|stalled|completed",
-        ...
-      }
-    ]
-  },
-  "l3": { "persona": [...] },
-  "_meta": {
-    "updated_at": "...",
-    "current_task_id": "task_<uuid>",    // 本次抽的是哪个任务
-    "tasks": [                            // 所有任务的状态
-      { "task_id": "task_<uuid>", "title": "...", "status": "ongoing|completed|stalled", "last_update": "..." }
-    ]
-  }
-}
-```
-
-### 7.6.3 写入逻辑（按任务决定）
-
-写入前必须读旧文件，按本次抽取任务与旧任务的关系决定动作：
-
-| 场景 | 判断 | 动作 |
-|------|------|------|
-| **同一任务有进展** | `task_id` 一致 / scenario title + topic 一致，本次是推进 | 覆盖该 `task_id` 对应的 KO + scenario 内容；推 `snapshot_window.to_iso`；`_meta.tasks` 更新该任务 `status` |
-| **同一任务新发现** | 同一 `task_id` 下又抽出新 KO | 追加到 `l1.kos`，场景本体不覆盖 |
-| **不同任务** | scenario title / topic 与现有完全不同 | 新建 `task_id`；在 `l2.scenarios` 里追加 scenario；KO 也追加 |
-| **同 persona** | summary 一致 | 去重不写 |
-| **新 persona** | summary 不同 | 追加到 `l3.persona` |
-
-### 7.6.4 增量衔接字段
-
-- `l0.snapshot_window.from_iso` ← 旧文件 `l0.snapshot_window.to_iso`（接续）
-- `l0.snapshot_window.to_iso` ← 本次对话终点 ISO 时间戳
-- `l1.kos` ← 同任务覆盖 + 不同任务追加
-- `l2.scenarios` ← 多 scenario 数组
-- `l3.persona` ← 去重追加
-- `_meta.updated_at` ← 本次写入时间
-- `_meta.tasks` ← 多任务状态追踪
+**抽取输出的 JSON Schema 与长期记忆 Schema 完全一致**，进入 `write_4layer` 时无需格式转换。
 
 ---
 

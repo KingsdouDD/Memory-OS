@@ -533,10 +533,13 @@ def recall_4layer(query, top_k=5, layers=None):
     Returns:
       {
         "query": str,
-        "persona": [...],    # L3 召回明细
-        "scenario": [...],   # L2 召回明细
+        # 老豆 2026-09-08 要求修复：L3/L2 只用作召回辅助（提取 entities/scenario_ids 给 L1 filter），
+        # 不进最终输出。L1 atom 才是用户要的“原子记忆”。
+        # 为保持调试可见性，L3/L2 明细仍保留在响应里但加 _aux 前缀，提醒上层不要注入。
+        "_aux_persona": [...],    # L3 召回明细（仅调试用，不注入提示词）
+        "_aux_scenario": [...],   # L2 召回明细（仅调试用，不注入提示词）
         "atom": [...],       # L1 最终结果（已 entity-overlap 重排 + kg_verify）
-        "memories": [...],   # 最终输出的 summary 列表
+        "memories": [...],   # 最终输出的 summary 列表（仅含 L1）
         "context": {         # 上下文信息（供调试用）
           "filter_entities": [...],
           "filter_scenario_ids": [...],
@@ -823,8 +826,9 @@ def recall_4layer(query, top_k=5, layers=None):
     return {
         "query": query,
         "layers": layers,
-        "persona": persona,
-        "scenario": scenario,
+        # 老豆 2026-09-08：L3/L2 只做 filter，不进最终输出
+        "_aux_persona": persona,
+        "_aux_scenario": scenario,
         "atom": merged_atom,
         "assoc_candidates": assoc_candidates if assoc_triggered else [],
         "raw": [],
@@ -877,8 +881,8 @@ def recall_for_hook(query, top_k=8, rrf_k=None):
         "graph": 0,
         "prf_kg_summaries": 0,
         "rrf_k": rrf_k or 60,
-        "aux_persona": len(result.get("persona", [])),
-        "aux_scenario": len(result.get("scenario", [])),
+        "aux_persona": len(result.get("_aux_persona", []) or result.get("persona", [])),
+        "aux_scenario": len(result.get("_aux_scenario", []) or result.get("scenario", [])),
         "l1_atom_count": len(atom),
         "assoc_count": assoc_mem_count,
         "assoc_candidates": ctx.get("assoc_candidate_count", 0),
