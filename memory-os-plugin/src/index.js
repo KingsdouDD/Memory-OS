@@ -83,7 +83,7 @@ function checkService(name, port) {
   });
 }
 
-// 2026-09-07 老豆要求修复：端口 up ≠ 模型就绪
+// 端口 up ≠ 模型就绪
 // 端口在监听但模型未加载完，recall 会卡死。
 // 这里真去推一个 /health 请求，超时 2s 判断模型是否热加载完成。
 function probeModelReady(port, timeoutMs = 2000) {
@@ -101,7 +101,7 @@ function probeModelReady(port, timeoutMs = 2000) {
   });
 }
 
-// 2026-09-07 老豆要求修复：模型拉不起来时强杀旧进程
+// 模型拉不起来时强杀旧进程
 // lsof 找占用端口的 PID，kill -9，逐个等退出
 function killPortProcess(port) {
   return new Promise((resolve) => {
@@ -137,7 +137,7 @@ function killPortProcess(port) {
   });
 }
 
-// 2026-09-07 老豆要求修复：拉一轮服务并探测健康
+// 拉一轮服务并探测健康
 // 用于 health 工具里"模型未就绪"路径的复用函数
 async function relaunchService(port, maxWait = 30) {
   const script = `import sys; sys.path.insert(0,'${path.resolve(__dirname, "../scripts")}'); ` +
@@ -593,7 +593,7 @@ async function runPython(args, options = {}) {
     }
     child.on("close", (code) => {
       if (timer) clearTimeout(timer);
-      // 老豆 2026-09-07 debug：把 stdout/stderr 写出来看工具实际收到的输出
+      // debug：把 stdout/stderr 写出来看工具实际收到的输出
       try {
         const fs = require("fs");
         fs.writeFileSync("/tmp/openclaw_recall_debug.json", stdout);
@@ -636,7 +636,7 @@ function getSessionKey(event, ctx) {
 
 function buildEnv(cfg) {
   if (!cfg) return {};
-  // 老豆 2026-09-07 修复：环境变量未设置时不要传空字符串
+  // 环境变量未设置时不要传空字符串
   // 原因：process_dream.py 用 os.environ.get(..., "default") 兜底，
   //       但 get 只在 var 不存在时才返回 default；如果传 ""，会覆盖 default，
   //       导致 url=f"http://{QDRANT_HOST}:{QDRANT_PORT}" 变成 "http://:6333" 报错
@@ -997,7 +997,7 @@ export default definePluginEntry({
         const layersArg = layers.join(",");
         let res;
         try {
-          // 2026-09-08 老豆要求修复：召回超过 30 秒硬超时，自动报错让模型调 health
+          // 召回超过 30 秒硬超时，自动报错让模型调 health
           // 之前是完全不限超时，embed/reranker 冷启动或服务卡住时模型会一直等，浪费时间。
           // 30 秒足够正常召回完成；超时说明服务有问题，让模型自己决定调 health。
           res = await runPython([
@@ -1047,7 +1047,7 @@ export default definePluginEntry({
           return { content: [{ type: "text", text: JSON.stringify(payload) }] };
         }
         // 检查是否真的召回到了内容（4 层都没结果也要明确反馈，避免静默成功）
-        // 老豆 2026-09-07 修复：原逻辑假设 payload.layers 是 dict，实际是字符串数组 ["L3","L2","L1"]
+        // 原逻辑假设 payload.layers 是 dict，实际是字符串数组 ["L3","L2","L1"]
         //   导致 Object.keys 返回索引数组，Array.isArray(items)=false，totalHits 永远是 0
         // 新逻辑：直接检查 payload.atom / persona / scenario / assoc_candidates / memories 的长度
         const atomCount = Array.isArray(payload?.atom) ? payload.atom.length : 0;
@@ -1302,7 +1302,7 @@ export default definePluginEntry({
             up = await checkService(name, port).catch(() => false);
           }
 
-          // 2026-09-07 老豆要求修复：端口 up ≠ 模型就绪
+          // 端口 up ≠ 模型就绪
           // embed / reranker 额外探 /health 端点，验证模型是否热加载完
           if (up && (name === "embed" || name === "reranker")) {
             const probe = await probeModelReady(port, 3000);
@@ -1400,8 +1400,8 @@ export default definePluginEntry({
     });
 
     // ── 工具：memory_os_extract_runtime（按提示词抽取 + 按状态分流）─────────────
-    // 设计：老豆手动调。工作流：
-    //   1. 老豆说"按提示词抽临时记忆"或"总结今天"
+    // 设计：手动调。工作流：
+    //   1. 用户说"按提示词抽临时记忆"或"总结今天"
     //   2. LLM 先读 prompts/runtime_memory_extract.md（提示词模板）
     //   3. 按提示词规则抽取当前对话上下文 → 输出 4 层 JSON
     //   4. 判断 status（completed / ongoing / stalled）
@@ -1409,7 +1409,7 @@ export default definePluginEntry({
     //   6. 工具按 status 分流：
     //      - completed → 调 write_4layer.py 写入 Memory-OS（永久） + 清空临时文件
     //      - ongoing/stalled → 原样覆盖 runtime_active_state/{sessionKey}.json
-    // 临时文件 = LLM 抽出的 4 层 JSON 原样 + _meta 元数据（老豆原话："什么格式就存什么格式"）
+    // 临时文件 = LLM 抽出的 4 层 JSON 原样 + _meta 元数据（原话："什么格式就存什么格式"）
     api.registerTool((toolCtx) => ({
       name: "memory_os_extract_runtime",
       description: `[工作流工具] 按 prompts/runtime_memory_extract.md 提示词抽取当前对话上下文 + 按状态分流。
@@ -1420,19 +1420,19 @@ export default definePluginEntry({
 3. 判断任务状态 status：
    - completed：任务已完结，可存入永久记忆
    - ongoing：任务进行中，覆盖临时记忆
-   - stalled：任务已停滞（老豆已转向其他话题），覆盖临时记忆
+   - stalled：任务已停滞（用户已转向其他话题），覆盖临时记忆
 4. 调本工具，传 memory_json + status
 5. 工具按 status 自动分流：completed → 写入 Memory-OS；ongoing/stalled → 原样覆盖临时记忆文件
 
-老豆说"按提示词抽临时记忆"、"总结今天"、"存储今天的对话"时调用。
+用户说"按提示词抽临时记忆"、"总结今天"、"存储今天的对话"时调用。
 
-【重要】老豆 必须 传 sessionKey（手动是唯一可靠途径）：
+【重要】必须 传 sessionKey（手动是唯一可靠途径）：
 - params.sessionKey 格式 = "<channel>:<user_id>"
 - QQ: "qqbot:c2c:<your_openid>"（替换为你自己的 QQ openid）
-- 微信: "weixin:<your_openid>"（老豆有多个微信，必须按 openid 区分）
+- 微信: "weixin:<your_openid>"（多个微信，必须按 openid 区分）
 - Telegram: "telegram:<user_id>"
 
-如果不传 sessionKey，工具会 fallback 到 runtime context（可能拿不到，到时会让老豆重传）。老豆主动传 sessionKey 是最可靠的方式。`,
+如果不传 sessionKey，工具会 fallback 到 runtime context（可能拿不到，到时会让你重传）。主动传 sessionKey 是最可靠的方式。`,
       parameters: {
         type: "object",
         properties: {
@@ -1491,7 +1491,7 @@ export default definePluginEntry({
         const channel = (ctxChannel || "").toLowerCase();
         const sender = (ctxSender || "").replace(/[^a-zA-Z0-9_.-]/g, "_");
         if (channel.includes("weixin") || channel.includes("wechat")) {
-          // 微信按用户 openid 分（老豆有多个微信账号，不能合在一起）
+          // 微信按用户 openid 分（多个微信账号，不能合在一起）
           if (sender && sender !== "_") agentId = `wechat_${sender}`;
           else agentId = "wechat_unknown";
         } else if (channel.includes("qqbot") || channel.includes("qq")) {
@@ -1667,8 +1667,8 @@ export default definePluginEntry({
             ok: true, status, action: "state_overwritten",
             stateFile,
             next_hint: status === "ongoing"
-              ? `任务进行中，临时记忆已覆盖。下次老豆说“按提示词抽取”时，使用上次抽取内容作为参考。`
-              : `任务已停滞。临时记忆已覆盖。如果老豆回来，可调 memory_os_recall 查历史 + 重读 ${stateFile} 继续。`,
+              ? `任务进行中，临时记忆已覆盖。下次用户说"按提示词抽取"时，使用上次抽取内容作为参考。`
+              : `任务已停滞。临时记忆已覆盖。如果用户回来，可调 memory_os_recall 查历史 + 重读 ${stateFile} 继续。`,
             prompt_template: PROMPT_PATH,
           }, null, 2) }] };
         } catch (e) {
