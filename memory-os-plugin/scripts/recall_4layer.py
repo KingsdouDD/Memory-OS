@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-4 层记忆召回器 v2（2026-08-26 重写）
+4 层记忆召回器 v2（2026-08-26）
 
 与 v1 的根本区别：
   v1: L3/L2 的 summary 拆成碎片词 → 塞进 expanded_query → 污染 L1 向量搜索
