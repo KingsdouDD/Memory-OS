@@ -41,6 +41,74 @@ from process_dream import embed, _qdrant_client
 from recall_fusion import fusion_post_fuse, fusion_boost_graph_hits, kg_verify_v2, association_expand
 from recall_config import RecallConfig
 
+# ── 模型探活 + 智能拉起 ───────────────────────────────────────
+# 端口 up ≠ 模型就绪。idle timeout 后进程还在但模型已卸载。
+# 策略：先 probe /health，好就跳过，不好才 kill + 重拉。
+# 正常情况下钩子调用几乎零开销。
+
+def _probe_model_ready(port, timeout=2):
+    """探模型是否热加载完成（HTTP GET /health）。"""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def _port_listening(port, timeout=0.5):
+    import socket
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+        return True
+
+
+def _kill_port(port):
+    """强制 kill 占用端口的进程。"""
+    import subprocess
+    try:
+        out = subprocess.check_output(["lsof", "-i", f":{port}", "-P", "-n", "-t"], text=True)
+        for pid in out.strip().split("\n"):
+            pid = pid.strip()
+            if pid:
+                try:
+                    os.kill(int(pid), 9)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
+def _ensure_model_ready(port, max_wait=30):
+    """确保模型就绪：先 probe，好就跳过，不好才 kill + 重拉。"""
+    if _probe_model_ready(port):
+        print(f"[recall] model port {port} already ready, skip", file=sys.stderr)
+        return True
+
+    print(f"[recall] model port {port} not ready, restarting...", file=sys.stderr)
+    _kill_port(port)
+    time.sleep(1)  # 等端口释放
+
+    # 重新 spawn
+    try:
+        from service_lifecycle import _spawn_daemon
+        ok = _spawn_daemon(port)
+        if not ok:
+            return False
+    except Exception as e:
+        print(f"[recall] _spawn_daemon failed for port {port}: {e}", file=sys.stderr)
+        return False
+
+    # 等端口 + 模型都就绪
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        if _probe_model_ready(port):
+            print(f"[recall] model port {port} ready after restart", file=sys.stderr)
+            return True
+        time.sleep(0.5)
+    print(f"[recall] model port {port} still not ready after {max_wait}s", file=sys.stderr)
+    return False
+
+
 # ── Reranker 服务（Qwen3-Reranker-0.6B）──────────────────────────
 RERANKER_URL = "http://127.0.0.1:8877/rerank"
 
@@ -548,16 +616,13 @@ def recall_4layer(query, top_k=5, layers=None):
         }
       }
     """
-    # 进入召回前，主动拉起依赖的 embed/reranker 服务（idle 超时后进程可能已 dead）
-    # max_wait 从 90 降到 30
-    # 原因：端口起来一般 5-10s，模型加载是服务内部的事，等再久也是服务内部 race
-    # 真等不了时直接返回失败让上层走降级路径，不要让用户干等
+    # 进入召回前：先 probe，模型 OK 就跳过，不好才 kill + 重拉
+    # 正常情况下几乎零开销，不会杀进程
     try:
-        from service_lifecycle import ensure_service_up
-        ensure_service_up(8765, max_wait=30)  # embed
-        ensure_service_up(8877, max_wait=30)  # reranker
+        _ensure_model_ready(8765)  # embed
+        _ensure_model_ready(8877)  # reranker
     except Exception as e:
-        print(f"[warn] ensure service up failed at recall entry: {e}", file=sys.stderr)
+        print(f"[warn] ensure_model_ready failed at recall entry: {e}", file=sys.stderr)
     if layers is None:
         layers = ["L3", "L2", "L1"]
 
