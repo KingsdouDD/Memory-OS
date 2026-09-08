@@ -80,12 +80,13 @@ User Input
 │  Step 1: L3 recall（persona, 0.62, top 20）│  → 路由信号: entities
 │  Step 2: L2 recall（scenario, 0.62, top 20）│  → 路由信号: scenario_ids
 │  Step 2.5: jieba entity 补充          │
-│  Step 3: Neo4j graph (多跳联想)       │  → entities 给候选池加分
+│  Step 3: Neo4j graph (1-hop direct, no PRF) │  → entities + fusion boost ×1.3
 │  Step 4: 向量召回 (Qdrant 跨层, 0.62)│  → 唯一主召回路径（无 Path A/B）
 │         BM25 (memory_l0 only, 旁路)   │  → 不进主输出
+│  Step 3.5: Graph Fusion Integration   │  → fusion_boost_graph_hits + fusion_post_fuse
 │  Step 6: 融合重排 + Reranker × 1     │
 │         final_score = rerank×0.6 + overlap×0.4 │
-│         ❌ 删除了 0.55 rerank score 硬过滤
+│         rerank < 0.55 → discard (硬过滤)
 │  → 取 top 5 → PID 关联 L1 → 输出     │
 └──────────────────────────────────────┘
    │
@@ -102,7 +103,7 @@ User Input
 > **详细架构 / 改动说明 / 召回链路 trace / 性能基线** →
 > 见 [`ARCHITECTURE.md`](ARCHITECTURE.md)
 >
-> 关键改动 (2026-09-07): Step 4 Path A/B 删除改为单一向量召回; Reranker 0.55 硬过滤删除;
+> 关键改动 (2026-09-08): Step 3 PRF 多跳删除，改为 1-hop direct + fusion boost; Step 3.5 新增 Graph Fusion Integration; 0.55 硬过滤恢复;
 > 新增 `scripts/_numpy_compat.py` (Python 3.14 + numpy 2.0+ 兼容).
 
 ---
