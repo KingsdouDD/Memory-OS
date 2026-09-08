@@ -122,7 +122,7 @@
 
 ## 4. 2026-09-08 的关键改动
 
-### 4.1 删除 PRF 多跳扩张，改为 1-hop direct
+### 4.1 删除 PRF 多跳扩张
 
 **改动前**:
 ```python
@@ -172,7 +172,7 @@ merged_atom = fusion_boost_graph_hits(
 merged_atom = fusion_post_fuse(merged_atom)
 ```
 
-### 4.3 恢复 0.55 Reranker 硬过滤
+### 4.3 恢复 0.55 Reranker
 
 **改动前**:
 ```python
