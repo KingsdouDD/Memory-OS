@@ -1273,6 +1273,30 @@ def neo4j_upsert_ko(ko):
     DENIED_WORDS = RecallConfig.DENIED_PREDICATE_WORDS
     try:
         with driver.session() as session:
+            # 0) 🔧 2026-09-09 PID 级联追溯：建 KO 主节点（以 _gen_pid_v5() 生成的 PID 为 key）
+            # 🔧 2026-09-09 修复 PID 溢出：Neo4j signed int64 不支持 _gen_pid_v5() 的 64-bit unsigned 范围
+            # 改用 pid_str 字符串存 PID，同时保留原 pid 数值（如果能存的话）兼容旧记录
+            try:
+                _ko_pid = _gen_pid_v5(ko)
+                session.run(
+                    """MERGE (k:KO {pid_str: $pid_str})
+                       SET k.pid = $pid_int,
+                           k.summary = $summary,
+                           k.type = $kotype,
+                           k.recorded_at = $rec_at,
+                           k.source_time = $src_at,
+                           k.updated = $ts""",
+                    pid_str=str(_ko_pid),
+                    pid_int=_ko_pid if (_ko_pid < 9223372036854775807) else None,
+                    summary=ko.get("summary", "")[:500],
+                    kotype=ko.get("type", "fact"),
+                    rec_at=rec_at,
+                    src_at=src_at,
+                    ts=_now_cn(),
+                )
+            except Exception as _ke:
+                print(f"[warn] KO node merge failed (non-fatal): {_ke}", file=sys.stderr)
+
             # 1) 实体 — 节点带 4 个时间字段
             for ent in ko.get("entities") or []:
                 name = (ent.get("name") or "").strip()
@@ -1854,6 +1878,103 @@ def _execute_override_v5(ko, kotype, collection, client, target_pid, report):
     except Exception as e:
         print(f"[warn] override qdrant failed: {e}", file=sys.stderr)
         report["qdrant_errors"] += 1
+
+
+def write_kos_v5_return_pids(kos):
+    """v5 写入 + 返回每条 KO 的 PID（用于多层级联追溯）。
+    🔧 2026-09-09 新增：和 write_kos_v5() 逻辑一致，但额外收集每条 KO 的 PID。
+    PID 由 _gen_pid_v5() 生成（纯函数，entities+relations → 同事实同 PID）。
+
+    返回：
+      {
+        "report": {...},                # 同 write_kos_v5() 的统计报告
+        "pids": [pid, pid, ...],        # 本次写入/更新的 KO PID 列表（按顺序）
+        "actions": [(pid, action), ...]  # PID 对应的决策（CREATE/UPDATE/SKIP）
+      }
+    """
+    from collections import OrderedDict
+    result = {"report": {}, "pids": [], "actions": []}
+    report = {
+        "create": 0, "update": 0, "override": 0, "skipped": 0, "errors": 0,
+        "neo4j": {"entities": 0, "relations": 0},
+        "qdrant_written": 0, "qdrant_updated": 0, "qdrant_overridden": 0,
+        "neo4j_errors": 0, "qdrant_errors": 0,
+    }
+    result["report"] = report
+    client = None
+    try:
+        client = _qdrant_client()
+    except Exception as e:
+        print(f"[warn] qdrant client init failed: {e}", file=sys.stderr)
+
+    for ko in kos:
+        try:
+            ko_inner, dropped = clean_ko_for_write(ko)
+            if dropped:
+                continue
+            ko_inner = _normalize_time_fields(ko_inner)
+            kotype = ko_inner.get("type") or "fact"
+            collection = qdrant_collection_for(kotype)
+            if client is not None:
+                try:
+                    qdrant_ensure_collection(collection)
+                except Exception as e:
+                    print(f"[warn] ensure collection {collection}: {e}", file=sys.stderr)
+
+            candidates = _ann_find_candidates(client, collection, ko_inner)
+            action, reason = _rule_decide_action(ko_inner, candidates)
+
+            # PID 预计算：纯函数，同 KO 同 PID
+            try:
+                pid = _gen_pid_v5(ko_inner)
+            except Exception as e:
+                print(f"[warn] _gen_pid_v5 failed: {e}", file=sys.stderr)
+                pid = None
+
+            if action == "CREATE":
+                report["create"] += 1
+                _execute_create_v5(ko_inner, kotype, collection, client, report)
+            elif action == "SKIP":
+                report["skipped"] += 1
+            elif action.startswith("UPDATE:"):
+                idx = int(action.split(":", 1)[1]) - 1
+                if 0 <= idx < len(candidates):
+                    cand = candidates[idx]
+                    report["update"] += 1
+                    # 覆盖 pid：UPDATE 的 PID 是候选的，不是新生成的
+                    pid = cand.get("pid") or pid
+                    _execute_update_v5(ko_inner, kotype, cand.get("collection", collection), client, cand["pid"], report)
+                else:
+                    report["errors"] += 1
+                    print(f"[warn] UPDATE 序号越界: {action} (candidates={len(candidates)})", file=sys.stderr)
+            elif action.startswith("OVERRIDE:"):
+                idx = int(action.split(":", 1)[1]) - 1
+                if 0 <= idx < len(candidates):
+                    cand = candidates[idx]
+                    report["override"] += 1
+                    pid = cand.get("pid") or pid
+                    _execute_override_v5(ko_inner, kotype, cand.get("collection", collection), client, cand["pid"], report)
+                else:
+                    report["errors"] += 1
+                    print(f"[warn] OVERRIDE 序号越界: {action} (candidates={len(candidates)})", file=sys.stderr)
+            else:
+                report["create"] += 1
+                _execute_create_v5(ko_inner, kotype, collection, client, report)
+
+            _log_decision(action, reason, ko_inner, candidates)
+
+            if pid is not None:
+                result["pids"].append(str(pid))
+                result["actions"].append((str(pid), action))
+        except Exception as e:
+            report["errors"] += 1
+            print(f"[warn] write_kos_v5_return_pids ko failed: {e}", file=sys.stderr)
+            _log_decision("ERROR", str(e), ko, [])
+
+    if trigger_bm25_rebuild is not None:
+        trigger_bm25_rebuild(async_build=True)
+
+    return result
 
 
 def write_kos_v5(kos):

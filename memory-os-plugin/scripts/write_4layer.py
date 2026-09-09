@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from process_dream import (
     embed, _now_cn_iso, _qdrant_client,
     qdrant_ensure_collection, qdrant_upsert_point,
-    write_kos_v5, _normalize_time_fields,
+    write_kos_v5, write_kos_v5_return_pids, _normalize_time_fields,
 )
 from recall_config import RecallConfig
 
@@ -127,12 +127,13 @@ def _safe_label(label):
     return label
 
 
-def write_l0_conversation(l0_payload, l1_kos=None):
+def write_l0_conversation(l0_payload, l1_kos=None, linked_l1_pids=None):
     """写 L0 原始对话：全文 BM25 召回通道。
 
     Args:
         l0_payload: {"scene_summary": "...", "source": "..."}
         l1_kos: 对应的 L1 KO 列表（用于反向关联 Neo4j 边）
+        linked_l1_pids: 可选，已写入的 L1 PID 列表（用于跨层级联删除追溯）
 
     L0 用 UUID 作 point id（与 L1/L2/L3 不共享 ID 空间）。
     Neo4j 建 :L0Conversation 节点，反向边 :GENERATED → L1 KO（如果 L1 KO 已写入）。
@@ -188,6 +189,8 @@ def write_l0_conversation(l0_payload, l1_kos=None):
                 "layer": "L0",
                 "source": source,
                 "ts": _now_cn_iso(),
+                # 🔧 2026-09-09 新增：跨层级联追溯字段（与 L1 反向关联）
+                "linked_l1_pids": list(linked_l1_pids) if linked_l1_pids else [],
             }
             qdrant_upsert_point(client, L0_COLLECTION, l0_pid, vec, payload)
             qdrant_ok = True
@@ -246,6 +249,17 @@ def write_l0_conversation(l0_payload, l1_kos=None):
                             ko_summary=ko_summary,
                             ts=_now_cn_str(),
                         )
+
+                # 🔧 2026-09-09 PID 级联追溯：L0 → KO 节点直接连边（不依赖实体）
+                if linked_l1_pids:
+                    for ko_pid in linked_l1_pids:
+                        session.run(
+                            """MATCH (l:L0Conversation {l0_id: $l0_id})
+                               MATCH (k:KO {pid_str: $ko_pid})
+                               MERGE (l)-[r:L0_GENERATED]->(k)
+                               SET r.updated = $ts""",
+                            l0_id=l0_pid, ko_pid=str(ko_pid), ts=_now_cn_str(),
+                        )
             driver.close()
             neo4j_ok = True
         except Exception as e:
@@ -268,14 +282,16 @@ def _neo4j_driver():
     )
 
 
-def write_l2_scenario(scenario):
+def write_l2_scenario(scenario, linked_l1_pids=None):
     """写 L2 scenario：Neo4j Scenario 节点 + Qdrant memory_scenario collection。
 
     失败兜底：每一步异常都不抛异常，记录 ok=False。
     去重逻辑：照搬 L1 的 ANN 三态决策（SKIP / UPDATE / CREATE）。
+
+    Args:
+        scenario: scenario dict
+        linked_l1_pids: 可选，本场景关联的 L1 PID 列表（用于跨层级联删除追溯）
     """
-    if not scenario:
-        return {"layer": "L2", "skipped": True, "reason": "scenario is null"}
 
     title = (scenario.get("title") or "").strip()
     summary = (scenario.get("summary") or "").strip()
@@ -363,6 +379,17 @@ def write_l2_scenario(scenario):
                     """,
                     sid=scenario_id, name=name, ts=_now_cn_str(),
                 )
+
+            # 🔧 2026-09-09 PID 级联追溯：从 L1 KO 节点连边到 Scenario
+            if linked_l1_pids:
+                for ko_pid in linked_l1_pids:
+                    session.run(
+                        """MATCH (k:KO {pid_str: $ko_pid})
+                           MATCH (s:Scenario {scenario_id: $sid})
+                           MERGE (k)-[r:BELONGS_TO]->(s)
+                           SET r.updated = $ts""",
+                        ko_pid=str(ko_pid), sid=scenario_id, ts=_now_cn_str(),
+                    )
         driver.close()
         neo4j_ok = True
     except Exception as e:
@@ -395,6 +422,8 @@ def write_l2_scenario(scenario):
                 "recorded_at": scenario.get("recorded_at", ""),
                 "source_time": scenario.get("source_time", ""),
                 "ts": _now_cn_iso(),
+                # 🔧 2026-09-09 新增：跨层级联追溯字段（与 L1 反向关联）
+                "linked_l1_pids": list(linked_l1_pids) if linked_l1_pids else [],
             }
             qdrant_upsert_point(client, L2_COLLECTION, pid, vec, payload)
             qdrant_ok = True
@@ -409,8 +438,13 @@ def write_l2_scenario(scenario):
     }
 
 
-def write_l3_personas(personas):
-    """写 L3 persona 列表：Neo4j Persona 节点 + Qdrant memory_persona collection。"""
+def write_l3_personas(personas, linked_l1_pids=None):
+    """写 L3 persona 列表：Neo4j Persona 节点 + Qdrant memory_persona collection。
+
+    Args:
+        personas: persona dict 列表
+        linked_l1_pids: 可选，所有 persona 共享的 L1 PID 列表（用于跨层级联删除追溯）
+    """
     if not personas:
         return {"layer": "L3", "skipped": True, "reason": "personas is empty"}
 
@@ -456,15 +490,17 @@ def write_l3_personas(personas):
                 pid = _gen_pid_layer(summary, "L3")
                 session.run(
                     """
-                    MERGE (p:Persona {pid: $pid})
-                    SET p.persona_type = $ptype,
+                    MERGE (p:Persona {pid_str: $pid_str})
+                    SET p.pid = $pid_int,
+                        p.persona_type = $ptype,
                         p.state = $state,
                         p.importance = $imp,
                         p.recorded_at = $rec_at,
                         p.source_time = $src_at,
                         p.updated = $ts
                     """,
-                    pid=pid,
+                    pid_str=str(pid),
+                    pid_int=pid if pid < 9223372036854775807 else None,
                     ptype=p.get("type", "fact"),
                     state=p.get("state", "active"),
                     imp=float(p.get("importance", 0.8)),
@@ -472,6 +508,17 @@ def write_l3_personas(personas):
                     src_at=p.get("source_time", ""),
                     ts=_now_cn_str(),
                 )
+
+                # 🔧 2026-09-09 PID 级联追溯：从 L1 KO 节点连边到 Persona
+                if linked_l1_pids:
+                    for ko_pid in linked_l1_pids:
+                        session.run(
+                            """MATCH (k:KO {pid_str: $ko_pid})
+                               MATCH (p:Persona {pid_str: $p_pid})
+                               MERGE (k)-[r:DESCRIBES]->(p)
+                               SET r.updated = $ts""",
+                            ko_pid=str(ko_pid), p_pid=str(pid), ts=_now_cn_str(),
+                        )
             driver.close()
             neo4j_ok = True
         except Exception as e:
@@ -499,6 +546,8 @@ def write_l3_personas(personas):
                     "recorded_at": p.get("recorded_at", ""),
                     "source_time": p.get("source_time", ""),
                     "ts": _now_cn_iso(),
+                    # 🔧 2026-09-09 新增：跨层级联追溯字段（与 L1 反向关联）
+                    "linked_l1_pids": list(linked_l1_pids) if linked_l1_pids else [],
                 }
                 qdrant_upsert_point(client, L3_COLLECTION, pid, vec, payload)
                 qdrant_ok = True
@@ -554,25 +603,31 @@ def write_4layer(payload):
     l3_personas = l3_block.get("persona") or [] if isinstance(l3_block, dict) else []
 
     report = {"l0": None, "l1": None, "l2": None, "l3": None}
+    # 🔧 2026-09-09 PID 级联追溯改造：L1 先写拿到 PID，L0/L2/L3 拿这些 PID 写入
+    l1_pids = []  # 收集本批 L1 的 PID，传给 L0/L2/L3
+    l1_report = {}
 
-    # L0 先写（拿到 l0_id 之后 L1 关联用）
-    if l0 and l0.get("scene_summary"):
-        report["l0"] = write_l0_conversation(l0, l1_kos=l1_kos)
-
-    # L1 走原路径（最稳）
+    # 1) L1 先写（拿到 PID，供 L0/L2/L3 反向关联用）
     if l1_kos:
         try:
-            report["l1"] = write_kos_v5(l1_kos)
+            l1_result = write_kos_v5_return_pids(l1_kos)
+            l1_pids = l1_result.get("pids", [])
+            l1_report = l1_result.get("report", {})
+            report["l1"] = l1_result
         except Exception as e:
             report["l1"] = {"error": str(e)}
 
-    # L2
-    if l2_scenario:
-        report["l2"] = write_l2_scenario(l2_scenario)
+    # 2) L0 带 linked_l1_pids 写入（同时传 l1_kos 用于 Neo4j GENERATED 边）
+    if l0 and l0.get("scene_summary"):
+        report["l0"] = write_l0_conversation(l0, l1_kos=l1_kos, linked_l1_pids=l1_pids)
 
-    # L3
+    # 3) L2 带 linked_l1_pids 写入
+    if l2_scenario:
+        report["l2"] = write_l2_scenario(l2_scenario, linked_l1_pids=l1_pids)
+
+    # 4) L3 带 linked_l1_pids 写入
     if l3_personas:
-        report["l3"] = write_l3_personas(l3_personas)
+        report["l3"] = write_l3_personas(l3_personas, linked_l1_pids=l1_pids)
 
     return report
 
@@ -694,6 +749,177 @@ def _neo4j_soft_delete_l0(l0_id):
     finally:
         driver.close()
     return deleted
+
+
+# ============================================================
+# 🔧 2026-09-09 PID 级联删除：一条 L1 PID 带走所有 4 层关联
+# ============================================================
+
+# L1 按 type 分到多个 collection，列在这里反查
+L1_COLLECTIONS = ["memory_fact", "memory_concept", "memory_event", "memory_preference",
+                  "memory_routine", "memory_goal", "memory_decision", "memory_experience"]
+
+
+def delete_by_pid_cascade(l1_pid):
+    """通过 L1 PID 反查所有层关联，一次清干净。
+
+    流程：
+    1. 反查 L0/L2/L3 payload里 linked_l1_pids 是否包含这个 PID
+       → 拿到 l0_ids / l2_pids / l3_pids
+    2. Qdrant: 删 L0 + L1 + L2 + L3 point
+    3. Neo4j: DETACH DELETE 关联 (:KO) / (:Scenario) / (:Persona) / (:L0Conversation)
+
+    Returns:
+        {"deleted": {"l0": n, "l1": n, "l2": n, "l3": n, "ko": n},
+         "l0_ids": [...], "l2_pids": [...], "l3_pids": [...]}
+    """
+    deleted = {"l0": 0, "l1": 0, "l2": 0, "l3": 0, "ko": 0}
+    result = {"deleted": deleted, "l0_ids": [], "l2_pids": [], "l3_pids": [], "l1_collection": None}
+
+    # PID 转 int（Qdrant PID 是大整数）
+    try:
+        l1_pid_int = int(l1_pid)
+    except (ValueError, TypeError):
+        return {"error": f"L1 PID 不是合法整数: {l1_pid}", "deleted": deleted}
+
+    # ---- 1. 反查 L0/L2/L3 payload ----
+    l0_ids = set()
+    l2_pids = set()
+    l3_pids = set()
+    l1_collection = None
+    l1_payload = None
+
+    try:
+        client = _qdrant_client()
+        # 找 L1（所有可能的 collection）
+        for coll in L1_COLLECTIONS:
+            try:
+                pts = client.retrieve(collection_name=coll, ids=[l1_pid_int])
+            except Exception:
+                continue
+            if pts:
+                l1_payload = pts[0].payload or {}
+                l1_collection = coll
+                deleted["l1"] = 1
+                break
+
+        if l1_payload is None:
+            return {"error": f"L1 PID 在 Qdrant 里查不到: {l1_pid}", "deleted": deleted}
+
+        result["l1_collection"] = l1_collection
+
+        # 反查 L2
+        try:
+            from qdrant_client.models import Filter as QF, FieldCondition, MatchValue
+            f = QF(must=[FieldCondition(key="linked_l1_pids", match=MatchValue(value=str(l1_pid)))])
+            l2_hits = client.scroll(collection_name=L2_COLLECTION, scroll_filter=f, limit=100, with_payload=True, with_vectors=False)[0]
+            for p in l2_hits:
+                l2_pids.add(p.id)
+        except Exception as e:
+            print(f"[warn] cascade L2 lookup failed: {e}", file=sys.stderr)
+
+        # 反查 L3
+        try:
+            from qdrant_client.models import Filter as QF, FieldCondition, MatchValue
+            f = QF(must=[FieldCondition(key="linked_l1_pids", match=MatchValue(value=str(l1_pid)))])
+            l3_hits = client.scroll(collection_name=L3_COLLECTION, scroll_filter=f, limit=100, with_payload=True, with_vectors=False)[0]
+            for p in l3_hits:
+                l3_pids.add(p.id)
+        except Exception as e:
+            print(f"[warn] cascade L3 lookup failed: {e}", file=sys.stderr)
+
+        # 反查 L0
+        try:
+            from qdrant_client.models import Filter as QF, FieldCondition, MatchValue
+            f = QF(must=[FieldCondition(key="linked_l1_pids", match=MatchValue(value=str(l1_pid)))])
+            l0_hits = client.scroll(collection_name=L0_COLLECTION, scroll_filter=f, limit=100, with_payload=True, with_vectors=False)[0]
+            for p in l0_hits:
+                l0_ids.add(str(p.id))
+        except Exception as e:
+            print(f"[warn] cascade L0 lookup failed: {e}", file=sys.stderr)
+
+    except Exception as e:
+        return {"error": f"反查失败: {e}", "deleted": deleted}
+
+    # ---- 2. 删 Qdrant L2/L3/L0 point ----
+    try:
+        client = _qdrant_client()
+        from qdrant_client.models import PointIdsList
+
+        if l2_pids:
+            try:
+                client.delete(collection_name=L2_COLLECTION, points_selector=PointIdsList(points=list(l2_pids)))
+                deleted["l2"] = len(l2_pids)
+            except Exception as e:
+                print(f"[warn] delete L2 qdrant failed: {e}", file=sys.stderr)
+
+        if l3_pids:
+            try:
+                client.delete(collection_name=L3_COLLECTION, points_selector=PointIdsList(points=list(l3_pids)))
+                deleted["l3"] = len(l3_pids)
+            except Exception as e:
+                print(f"[warn] delete L3 qdrant failed: {e}", file=sys.stderr)
+
+        if l0_ids:
+            l0_int_ids = [int(x) for x in l0_ids if x.isdigit()]
+            try:
+                client.delete(collection_name=L0_COLLECTION, points_selector=PointIdsList(points=l0_int_ids))
+                deleted["l0"] = len(l0_int_ids)
+            except Exception as e:
+                print(f"[warn] delete L0 qdrant failed: {e}", file=sys.stderr)
+
+        # 删 L1 自己（最后一步，避免中间状态被查询到）
+        try:
+            client.delete(collection_name=l1_collection, points_selector=PointIdsList(points=[l1_pid_int]))
+            deleted["l1"] = 1
+        except Exception as e:
+            print(f"[warn] delete L1 qdrant failed: {e}", file=sys.stderr)
+
+    except Exception as e:
+        print(f"[warn] qdrant cascade delete failed: {e}", file=sys.stderr)
+
+    # ---- 3. 删 Neo4j 节点（DETACH DELETE 带走所有边）----
+    try:
+        driver = _neo4j_driver()
+        with driver.session() as session:
+            # 删 L2 Scenario 节点
+            for l2_pid in l2_pids:
+                session.run(
+                    """MATCH (s:Scenario {scenario_id: $sid})
+                       DETACH DELETE s""",
+                    sid=str(l2_pid),
+                )
+            # 删 L3 Persona 节点
+            for l3_pid in l3_pids:
+                session.run(
+                    """MATCH (p:Persona {pid: $pid})
+                       DETACH DELETE p""",
+                    pid=str(l3_pid),
+                )
+            # 删 L0 L0Conversation 节点
+            for l0_id in l0_ids:
+                session.run(
+                    """MATCH (l:L0Conversation {l0_id: $l0_id})
+                       DETACH DELETE l""",
+                    l0_id=str(l0_id),
+                )
+            # 删 L1 KO 节点（DETACH DELETE 带走 BELONGS_TO / DESCRIBES / L0_GENERATED 边）
+            res = session.run(
+                """MATCH (k:KO {pid_str: $pid_str})
+                   DETACH DELETE k
+                   RETURN count(k) AS cnt""",
+                pid_str=str(l1_pid),
+            )
+            rec = res.single()
+            deleted["ko"] = rec.get("cnt", 0) if rec else 0
+        driver.close()
+    except Exception as e:
+        print(f"[warn] neo4j cascade delete failed: {e}", file=sys.stderr)
+
+    result["l0_ids"] = list(l0_ids)
+    result["l2_pids"] = list(l2_pids)
+    result["l3_pids"] = list(l3_pids)
+    return result
 
 
 def confirm_delete_4layer(token, selected_pids=None):
@@ -819,6 +1045,9 @@ if __name__ == "__main__":
     parser.add_argument("--target-pid", default=None, help="直接指定要更新的 PID")
     parser.add_argument("--target-collection", default=None, help="target_pid 所在的 collection")
     parser.add_argument("--target-layer", choices=["L0","L1","L2","L3"], default=None, help="target_pid 的层")
+    # 🔧 2026-09-09 PID 级联删除快捷模式参数
+    parser.add_argument("--pid", default=None, help="L1 PID（与 --cascade 搭配使用，一次级联删 4 层）")
+    parser.add_argument("--cascade", action="store_true", help="PID 级联删除模式")
     args = parser.parse_args()
 
     if args.command == "ingest":
@@ -830,6 +1059,11 @@ if __name__ == "__main__":
         print(json.dumps(write_4layer(payload), ensure_ascii=False, indent=2))
 
     elif args.command == "delete":
+        # 🔧 2026-09-09 快捷模式：--pid + --cascade → 调用 delete_by_pid_cascade() 一次删 4 层
+        if args.pid and args.cascade:
+            result = delete_by_pid_cascade(args.pid)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            sys.exit(0)
         # 快捷模式：direct_pid + direct_collection + direct_layer → 直接删
         if args.direct_pid and args.direct_collection and args.direct_layer:
             client = _qdrant_client()
@@ -865,15 +1099,16 @@ if __name__ == "__main__":
             layers = [args.layer]
         result = recall_4layer(args.query, top_k=args.top_k, layers=layers)
         candidates = []
-        for m in result["persona"]:
+        # 🔧 2026-09-09 修复：recall_4layer v2 把 L3/L2 改名为 _aux_persona/_aux_scenario，避免上层误注入
+        for m in result.get("_aux_persona", []) or []:
             candidates.append({**m, "layer":"L3", "collection":L3_COLLECTION})
-        for m in result["scenario"]:
+        for m in result.get("_aux_scenario", []) or []:
             candidates.append({**m, "layer":"L2", "collection":L2_COLLECTION,
                               "scenario_id": m.get("scenario_id") or m.get("title") or ""})
-        for m in result["atom"]:
+        for m in result.get("atom", []) or []:
             candidates.append({**m, "layer":"L1", "collection":m.get("collection","memory_fact"),
                               "pid": m.get("_qdrant_pid") or m.get("pid")})
-        for m in result["raw"]:
+        for m in result.get("raw", []) or []:
             candidates.append({**m, "layer":"L0", "collection":L0_COLLECTION,
                               "pid": m.get("_qdrant_pid") or m.get("pid")})
         if not candidates:
@@ -910,14 +1145,15 @@ if __name__ == "__main__":
         from recall_4layer import recall_4layer
         result = recall_4layer(args.query, top_k=args.top_k, layers=["L3","L2","L1","L0"])
         candidates = []
-        for m in result["persona"]:
+        # 🔧 2026-09-09 修复：recall_4layer v2 把 L3/L2 改名为 _aux_persona/_aux_scenario
+        for m in result.get("_aux_persona", []) or []:
             candidates.append({**m, "layer":"L3", "collection":L3_COLLECTION})
-        for m in result["scenario"]:
+        for m in result.get("_aux_scenario", []) or []:
             candidates.append({**m, "layer":"L2", "collection":L2_COLLECTION,
                               "scenario_id": m.get("title") or m.get("summary","")[:50]})
-        for m in result["atom"]:
+        for m in result.get("atom", []) or []:
             candidates.append({**m, "layer":"L1", "collection":"memory_fact"})
-        for m in result["raw"]:
+        for m in result.get("raw", []) or []:
             candidates.append({**m, "layer":"L0", "collection":L0_COLLECTION})
         if not candidates:
             print(json.dumps({"phase":"confirm","action":"update","candidates":[],
