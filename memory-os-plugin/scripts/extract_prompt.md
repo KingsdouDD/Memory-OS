@@ -317,6 +317,15 @@ state = discard
 - event_time：事件发生时间
 - valid_time：信息有效时间
 
+**时间精确度要求（硬约束）**：
+- 事件必须精确到**日**（`event_time.start` 格式 `YYYY-MM-DD`，`precision: "day"`）
+- **禁止使用模糊时间词**：明天、前天、去年、去年、前几天、以后、曾经、那时候
+- **如果对话中未提供具体日期，不编造**，但 `expression` 字段可写对话原文中的相对时间描述（如"今天下午"），同时 `precision` 设为 `day`
+- 示例：
+  - ❌ `expression: "昨天"` / `precision: "unknown"`
+  - ✅ `event_time.start: "2026-09-09"` / `expression: "2026-09-09 下午"` / `precision: "day"`
+  - ✅ 对话只说"今天"没给日期：`event_time.start: null` / `expression: "2026-09-09"` / `precision: "day"`（按消息 timestamp 补日期）
+
 如果无法确定具体时间：
 
 不要猜测。
