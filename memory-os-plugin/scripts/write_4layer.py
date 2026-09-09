@@ -861,10 +861,11 @@ def delete_by_pid_cascade(l1_pid):
                 print(f"[warn] delete L3 qdrant failed: {e}", file=sys.stderr)
 
         if l0_ids:
-            l0_int_ids = [int(x) for x in l0_ids if x.isdigit()]
+            # L0 PID 可能是 UUID 字符串或 int，统一传到 Qdrant 让它自己识别
+            l0_delete_ids = [int(x) if str(x).isdigit() else str(x) for x in l0_ids]
             try:
-                client.delete(collection_name=L0_COLLECTION, points_selector=PointIdsList(points=l0_int_ids))
-                deleted["l0"] = len(l0_int_ids)
+                client.delete(collection_name=L0_COLLECTION, points_selector=PointIdsList(points=l0_delete_ids))
+                deleted["l0"] = len(l0_delete_ids)
             except Exception as e:
                 print(f"[warn] delete L0 qdrant failed: {e}", file=sys.stderr)
 

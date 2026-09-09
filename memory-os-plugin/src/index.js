@@ -1074,7 +1074,7 @@ export default definePluginEntry({
     // 第二阶段：传 query + confirm=true + token + selected_pids（可选），真删
     api.registerTool({
       name: "memory_os_delete",
-      description: "从 Memory OS 4 层记忆（L0/L1/L2/L3）删除。两阶段：\n- confirm=false（默认）：召回候选 + 返回 token\n- confirm=true：带 token 真删\n快捷模式：传 target_pid + target_collection + target_layer + confirm=true，直接删除（跳过召回）\n支持按 layer 限定召回，支持 selected_pids 限定删哪些候选。",
+      description: "从 Memory OS 4 层记忆（L0/L1/L2/L3）删除。两阶段：\n- confirm=false（默认）：召回候选 + 返回 token\n- confirm=true：带 token 真删\n快捷模式：传 target_pid + confirm=true，默认走级联追溯删除（一次清干净 L0/L1/L2/L3 + Neo4j 节点）。\n传 cascade=false 可退回老的单层删除（不推荐）。\n支持按 layer 限定召回，支持 selected_pids 限定删哪些候选。",
       parameters: {
         type: "object",
         properties: {
@@ -1085,9 +1085,10 @@ export default definePluginEntry({
           token: { type: "string", description: "第一阶段返回的 token（第二阶段必传，快捷模式不需要）" },
           selected_pids: { type: "array", description: "限定只删哪些候选 pid（第二阶段可选）",
                            items: { type: "string" } },
-          target_pid: { type: "string", description: "直接指定要删除的 PID（快捷模式）" },
-          target_collection: { type: "string", description: "target_pid 所在的 collection（快捷模式）" },
-          target_layer: { type: "string", enum: ["L0","L1","L2","L3"], description: "target_pid 的层（快捷模式）" },
+          target_pid: { type: "string", description: "L1 PID（快捷模式，配合 confirm=true 使用）" },
+          target_collection: { type: "string", description: "【旧版兼容】target_pid 所在的 collection" },
+          target_layer: { type: "string", enum: ["L0","L1","L2","L3"], description: "【旧版兼容】target_pid 的层" },
+          cascade: { type: "boolean", description: "级联删除模式（target_pid 模式下默认 true）。true=走 delete_by_pid_cascade() 一次清 L0/L1/L2/L3 + Neo4j；false=单层删除（不推荐）", default: true },
         },
         required: [],
       },
@@ -1095,32 +1096,64 @@ export default definePluginEntry({
         const topK = Number(params.top_k || 5);
         const layer = params.layer || null;
         const confirm = params.confirm === true;
+        const cascade = params.cascade !== false;  // 默认 true
 
         // 第二阶段：真删
         if (confirm) {
-          const args = ["confirm", "--token", String(params.token || "")];
-          // 快捷模式：直接传 pid + collection + layer，跳过 token
+          // 🔧 2026-09-09 修复：快捷模式默认走级联追溯（PID cascade）
+          // 旧版走 direct_pid 单层删除会漏掉 L2/L3/L0 + Neo4j 边
           const hasDirect = params.target_pid && params.target_collection && params.target_layer;
-          if (hasDirect) {
-            args.splice(0, args.length, "delete",
+          const hasPidCascade = params.target_pid && cascade;
+
+          if (hasPidCascade) {
+            // 级联追溯模式：--pid + --cascade
+            const args = ["delete",
+              "--pid", String(params.target_pid),
+              "--cascade"];
+            const res = await runPython(
+              args,
+              { env: buildEnv(config), script: path.resolve(__dirname, "../scripts/write_4layer.py") }
+            );
+            const last = res.stdout.trim().split(/\n/).filter(Boolean).pop() || "{}";
+            let payload;
+            try { payload = JSON.parse(last); } catch { payload = { raw: res.stdout.slice(-500) }; }
+            return { content: [{ type: "text", text: JSON.stringify(payload) }] };
+          } else if (hasDirect) {
+            // 单层删除（仅在 cascade=false 时用）
+            const args = ["delete",
               "--direct-pid", String(params.target_pid),
               "--direct-collection", String(params.target_collection),
               "--direct-layer", String(params.target_layer),
-              "--query", String(params.query || ""));
-          } else if (!params.token) {
-            return { content: [{ type: "text", text: JSON.stringify({ error: "confirm=true 时必须传 token" }) }] };
+              "--query", String(params.query || "")];
+            if (Array.isArray(params.selected_pids) && params.selected_pids.length > 0) {
+              args.push("--selected-pids", params.selected_pids.join(","));
+            }
+            const res = await runPython(
+              args,
+              { env: buildEnv(config), script: path.resolve(__dirname, "../scripts/write_4layer.py") }
+            );
+            const last = res.stdout.trim().split(/\n/).filter(Boolean).pop() || "{}";
+            let payload;
+            try { payload = JSON.parse(last); } catch { payload = { raw: res.stdout.slice(-500) }; }
+            return { content: [{ type: "text", text: JSON.stringify(payload) }] };
+          } else {
+            // 老的两阶段 token 模式
+            const args = ["confirm", "--token", String(params.token || "")];
+            if (!params.token) {
+              return { content: [{ type: "text", text: JSON.stringify({ error: "confirm=true 时必须传 token 或 target_pid" }) }] };
+            }
+            if (Array.isArray(params.selected_pids) && params.selected_pids.length > 0) {
+              args.push("--selected-pids", params.selected_pids.join(","));
+            }
+            const res = await runPython(
+              args,
+              { env: buildEnv(config), script: path.resolve(__dirname, "../scripts/write_4layer.py") }
+            );
+            const last = res.stdout.trim().split(/\n/).filter(Boolean).pop() || "{}";
+            let payload;
+            try { payload = JSON.parse(last); } catch { payload = { raw: res.stdout.slice(-500) }; }
+            return { content: [{ type: "text", text: JSON.stringify(payload) }] };
           }
-          if (Array.isArray(params.selected_pids) && params.selected_pids.length > 0 && !hasDirect) {
-            args.push("--selected-pids", params.selected_pids.join(","));
-          }
-          const res = await runPython(
-            args,
-            { env: buildEnv(config), script: path.resolve(__dirname, "../scripts/write_4layer.py") }
-          );
-          const last = res.stdout.trim().split(/\n/).filter(Boolean).pop() || "{}";
-          let payload;
-          try { payload = JSON.parse(last); } catch { payload = { raw: res.stdout.slice(-500) }; }
-          return { content: [{ type: "text", text: JSON.stringify(payload) }] };
         }
 
         // 第一阶段：召回 + 生成 token
