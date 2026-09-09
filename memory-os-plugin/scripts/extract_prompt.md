@@ -317,15 +317,6 @@ state = discard
 - event_time：事件发生时间
 - valid_time：信息有效时间
 
-**时间精确度要求（硬约束）**：
-- 事件必须精确到**日**（`event_time.start` 格式 `YYYY-MM-DD`，`precision: "day"`）
-- **禁止使用模糊时间词**：明天、前天、去年、去年、前几天、以后、曾经、那时候
-- **如果对话中未提供具体日期，不编造**，但 `expression` 字段可写对话原文中的相对时间描述（如"今天下午"），同时 `precision` 设为 `day`
-- 示例：
-  - ❌ `expression: "昨天"` / `precision: "unknown"`
-  - ✅ `event_time.start: "2026-09-09"` / `expression: "2026-09-09 下午"` / `precision: "day"`
-  - ✅ 对话只说"今天"没给日期：`event_time.start: null` / `expression: "2026-09-09"` / `precision: "day"`（按消息 timestamp 补日期）
-
 如果无法确定具体时间：
 
 不要猜测。
@@ -666,6 +657,21 @@ L3 Tags：
 - 同一表达意思只保留一个 tag（如"旅游 / 旅行 / 出游"只保留一个）
 - Tag 数量限制：≤ 5 个
 - Tag 为中文或英文都可以，但不要混用表达同一个意思
+
+## 16.7 时间精度（硬约束）
+
+**禁止使用模糊时间词**，包括但不限于：
+- 明天、后天、前天、前年、去年、明年
+- 以后、曾经、那时候、前几天、前段时间
+- 以前、很久以前、最近、前不久
+
+**时间必须精确到「日」（day）**，格式为 `YYYY-MM-DD`。
+
+- `event_time.start` / `event_time.end` 使用 ISO8601 日期格式
+- `event_time.expression` 直接写 `YYYY-MM-DD` 格式（如 `"2026-09-09"`）
+- `event_time.precision` 填写 `day`
+
+如果当前 Scene 没有给出具体日期，按 runtime timestamp 补当天的日期（格式 `YYYY-MM-DD`），expression 写该日期。
 
 >
 > L2 保存可恢复的历史场景。
