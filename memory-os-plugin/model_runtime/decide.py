@@ -4,7 +4,7 @@
 model_runtime.decide
 ====================
 
-LLM 驱动的记忆写入决策。
+LLM 驱动的记忆写入决策
 
 解决的问题：
   原 write_4layer._rule_decide_layer_action 只看 cosine 分数（0.82 阈值），
