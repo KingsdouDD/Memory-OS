@@ -4,7 +4,7 @@
 model_runtime
 =============
 
-统一的模型运行时（基于 OpenClaw infer CLI）。
+统一的模型运行时（基于 OpenClaw infer CLI）
 
   - discovery: 探测当前活跃模型（从 OpenClaw session_status）
   - caller:    调模型（通过 `openclaw infer model run`）
