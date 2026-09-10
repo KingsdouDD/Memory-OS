@@ -28,6 +28,13 @@ from process_dream import (
     qdrant_ensure_collection, qdrant_upsert_point,
     write_kos_v5, write_kos_v5_return_pids, _normalize_time_fields,
 )
+
+# LLM 驱动的去重决策（优先走 LLM，失败时降级到原规则）
+# 路径：scripts/write_4layer.py → ../model_runtime/dedup_bridge.py
+_BRIDGE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "model_runtime"))
+if _BRIDGE_PATH not in sys.path:
+    sys.path.insert(0, _BRIDGE_PATH)
+from dedup_bridge import dedup_decide_layer_action as _rule_decide_layer_action
 from recall_config import RecallConfig
 
 CN_TZ = timezone(timedelta(hours=8))
@@ -75,39 +82,6 @@ def _ann_find_candidates_in_collection(collection, text, top_k=5):
         return []
 
 
-def _rule_decide_layer_action(state, candidates):
-    """通用 ANN 三态决策（仿 L1 _rule_decide_action，但适配 L2/L3/L0）。
-
-    返回 (action, reason):
-      - "CREATE"  无候选或低分 → 新建
-      - "SKIP"    最高分 ≥ DEDUP_THRESHOLD → 完全重复
-      - "UPDATE"  0.6 ≤ 最高分 < 0.95 → 相似合并
-      - "DISCARD" state=uncertain 无候选 → 丢弃
-      - "INVALIDATE" state=uncertain 有候选 → 标记旧记录
-
-    state 默认 "active"；historical/uncertain 同 L1 逻辑。
-    """
-    state = state or "active"
-
-    if not candidates:
-        if state == "uncertain":
-            return "DISCARD", "state=uncertain, no candidates, discarded"
-        return "CREATE", "no candidates"
-
-    best = max(candidates, key=lambda c: c.get("score", 0))
-    score = float(best.get("score", 0))
-
-    if state == "uncertain":
-        return "INVALIDATE", f"state=uncertain, score={score:.3f}, invalidate old"
-    if state == "historical":
-        return "UPDATE", f"state=historical, score={score:.3f}, update old to historical"
-    if score >= RecallConfig.DEDUP_THRESHOLD:
-        return "SKIP", f"dup score={score:.3f} >= {RecallConfig.DEDUP_THRESHOLD}"
-    if score >= RecallConfig.WRITE_ANN_RECALL_THRESHOLD:
-        return "UPDATE", f"similar score={score:.3f}, merge supplement"
-    return "CREATE", f"new score={score:.3f} < recall threshold"
-
-
 def _now_cn_str():
     """CN 时区当前时间（字符串，用于 Neo4j SET 属性）。"""
     return datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -147,9 +121,9 @@ def write_l0_conversation(l0_payload, l1_kos=None, linked_l1_pids=None):
     if not scene_summary:
         return {"layer": "L0", "skipped": True, "reason": "缺少 scene_summary"}
 
-    # ---- 0. ANN 去重决策（仿 L1 三态）----
+    # ---- 0. ANN 去重决策（LLM 语义判断）----
     candidates = _ann_find_candidates_in_collection(L0_COLLECTION, scene_summary, top_k=5)
-    action, reason = _rule_decide_layer_action(l0_payload.get("state"), candidates)
+    action, reason = _rule_decide_layer_action(l0_payload.get("state"), candidates, layer="L0", new_text=scene_summary)
     if action == "SKIP":
         return {"layer": "L0", "skipped": True, "reason": f"dup: {reason}",
                 "l0_id": str(candidates[0]["pid"]) if candidates else None,
@@ -308,7 +282,7 @@ def write_l2_scenario(scenario, linked_l1_pids=None):
     # ---- 0. ANN 去重决策（仿 L1 _rule_decide_action）----
     ann_text = f"{title} {summary}"
     candidates = _ann_find_candidates_in_collection(L2_COLLECTION, ann_text, top_k=5)
-    action, reason = _rule_decide_layer_action(scenario.get("state"), candidates)
+    action, reason = _rule_decide_layer_action(scenario.get("state"), candidates, layer="L2", new_text=ann_text)
     if action == "SKIP":
         return {"layer": "L2", "skipped": True, "reason": f"dup: {reason}",
                 "scenario_id": scenario_id, "action": "SKIP"}
@@ -458,9 +432,9 @@ def write_l3_personas(personas, linked_l1_pids=None):
         p = _normalize_time_fields(p, source_path=None)
         p["layer"] = "L3"
 
-        # ---- ANN 去重决策（仿 L1 三态）----
+        # ---- ANN 去重决策（LLM 语义判断）----
         candidates = _ann_find_candidates_in_collection(L3_COLLECTION, summary, top_k=5)
-        action, reason = _rule_decide_layer_action(p.get("state"), candidates)
+        action, reason = _rule_decide_layer_action(p.get("state"), candidates, layer="L3", new_text=summary)
         if action == "SKIP":
             results.append({"layer": "L3", "skipped": True, "reason": f"dup: {reason}", "summary": summary[:60], "action": "SKIP"})
             continue
