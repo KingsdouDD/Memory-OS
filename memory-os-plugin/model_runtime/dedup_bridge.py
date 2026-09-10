@@ -4,9 +4,9 @@
 model_runtime.dedup_bridge
 ===========================
 
-作为 write_4layer.py 与 model_runtime.decide 之间的桥。
+作为 write_4layer.py 与 model_runtime.decide 之间的桥
 
-设计原则（老豆拍板 2026-09-10）：
+设计原则（拍板 2026-09-10）：
   - 写入工具不持有任何更新/合并机制
   - 不靠向量阈值做去重（向量模型蠢，阈值误判）
   - 去重由 LLM 语义判断决定 CREATE / SKIP / INVALIDATE / DISCARD
