@@ -10,7 +10,7 @@
   - 不修改 process_dream.py / recall_config.py 任何代码
   - L1 走原路径，L2/L3 独立写入
   - 所有错误降级（写失败不抛异常，返回 ok=False）
-  - 不动现有数据（PID 独立生成，不撞车）
+  - 不动现有数据（PID 独立生成）
 """
 
 import os
