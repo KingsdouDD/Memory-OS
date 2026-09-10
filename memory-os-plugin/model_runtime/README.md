@@ -1,6 +1,6 @@
 # model_runtime
 
-统一模型运行时，解决 Memory OS 写入去重 bug。
+统一模型运行时，解决 Memory OS 写入去重 bug
 
 ## 目录结构
 
