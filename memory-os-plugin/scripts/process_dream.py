@@ -1281,14 +1281,12 @@ def neo4j_upsert_ko(ko):
                 session.run(
                     """MERGE (k:KO {pid_str: $pid_str})
                        SET k.pid = $pid_int,
-                           k.summary = $summary,
                            k.type = $kotype,
                            k.recorded_at = $rec_at,
                            k.source_time = $src_at,
                            k.updated = $ts""",
                     pid_str=str(_ko_pid),
                     pid_int=_ko_pid if (_ko_pid < 9223372036854775807) else None,
-                    summary=ko.get("summary", "")[:500],
                     kotype=ko.get("type", "fact"),
                     rec_at=rec_at,
                     src_at=src_at,
@@ -1356,7 +1354,6 @@ def neo4j_upsert_ko(ko):
                     CREATE (a)-[new_r:{pred}]->(b)
                     SET new_r.status = $status,
                         new_r.source = $source,
-                        new_r.ko_summary = $summary,
                         new_r.created = $ts,
                         new_r.updated = $ts,
                         new_r.event_time_start = $et_start,
@@ -1372,7 +1369,6 @@ def neo4j_upsert_ko(ko):
                 FOREACH (_ IN CASE WHEN old_r IS NOT NULL THEN [1] ELSE [] END |
                     SET old_r.status = $status,
                         old_r.source = $source,
-                        old_r.ko_summary = $summary,
                         old_r.updated = $ts,
                         old_r.event_time_start = $et_start,
                         old_r.event_time_end = $et_end,
@@ -1389,7 +1385,6 @@ def neo4j_upsert_ko(ko):
                     cypher,
                     subj=subj, obj=obj,
                     status=status, source=ko.get("source", ""),
-                    summary=ko.get("summary", ""),
                     ts=_now_cn(),
                     et_start=r_et_start, et_end=r_et_end,
                     et_expr=r_et_expr, et_prec=r_et_prec,

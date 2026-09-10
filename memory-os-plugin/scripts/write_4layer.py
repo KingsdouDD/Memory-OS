@@ -211,12 +211,11 @@ def write_l0_conversation(l0_payload, l1_kos=None, linked_l1_pids=None):
                             MATCH (a {name: $anchor})
                             WHERE EXISTS {
                                 MATCH (a)-[r]->()
-                                WHERE r.ko_summary = $ko_summary AND r.status <> 'deleted'
+                                WHERE r.status <> 'deleted'
                             }
                             WITH l, a LIMIT 1
                             MERGE (l)-[g:GENERATED]->(a)
-                            SET g.ko_summary = $ko_summary,
-                                g.updated = $ts
+                            SET g.updated = $ts
                             """,
                             l0_id=l0_pid,
                             anchor=anchor,
@@ -326,7 +325,6 @@ def write_l2_scenario(scenario, linked_l1_pids=None):
                 """,
                 sid=scenario_id,
                 title=title,
-                summary=summary,
                 stype=scenario.get("type", "event"),
                 state=scenario.get("state", "historical"),
                 imp=float(scenario.get("importance", 0.7)),
@@ -688,15 +686,15 @@ def _neo4j_soft_delete_scenario(scenario_id):
     return deleted
 
 
-def _neo4j_soft_delete_persona(summary):
+def _neo4j_soft_delete_persona(pid_str):
     driver = _neo4j_driver()
     deleted = 0
     try:
         with driver.session() as session:
             session.run(
-                """MATCH (p:Persona {summary: $summary})
+                """MATCH (p:Persona {pid_str: $pid_str})
                    SET p.status = 'deleted', p.updated = $ts""",
-                summary=summary, ts=_now_cn_str(),
+                pid_str=pid_str, ts=_now_cn_str(),
             )
             deleted = 1
     finally:
@@ -922,9 +920,7 @@ def confirm_delete_4layer(token, selected_pids=None):
             elif layer == "L3":
                 if _qdrant_delete_point(client, L3_COLLECTION, pid):
                     deleted["l3"] += 1
-                summary = cand.get("summary") or ""
-                if summary:
-                    _neo4j_soft_delete_persona(summary)
+                _neo4j_soft_delete_persona(str(pid))
             elif layer == "L1":
                 pid = cand.get("pid") or cand.get("_qdrant_pid")
                 coll = cand.get("collection", "memory_fact")
