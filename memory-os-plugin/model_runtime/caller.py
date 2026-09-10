@@ -4,7 +4,7 @@
 model_runtime.caller
 ====================
 
-通过 OpenClaw 的 `openclaw infer model run` 调用模型。
+通过 OpenClaw 的 `openclaw infer model run` 调用模型
 
 设计原则：
   - 工具不持有任何 API key / endpoint / auth 配置
