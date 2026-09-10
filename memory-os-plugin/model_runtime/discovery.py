@@ -4,7 +4,7 @@
 model_runtime.discovery
 =======================
 
-获取"当前系统正在使用的模型"。
+获取"当前系统正在使用的模型"
 
 设计原则：
   - 默认从 OpenClaw session_status 读取（与运行环境保持一致）
