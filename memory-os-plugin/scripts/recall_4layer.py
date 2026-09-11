@@ -37,9 +37,23 @@ import threading
 import time
 from pathlib import Path
 
-from process_dream import embed, _qdrant_client
+from process_dream import embed, _qdrant_client, neo4j_entity_search, neo4j_expand
 from recall_fusion import fusion_post_fuse, fusion_boost_graph_hits, kg_verify_v2, association_expand
 from recall_config import RecallConfig
+
+try:
+    from bm25_index import bm25_search as _bm25_search
+    BM25_AVAILABLE = True
+except Exception:
+    _bm25_search = None
+    BM25_AVAILABLE = False
+
+# ── 召回阈值（2026-09-11 与老豆确认）────────────────────────────
+VEC_TOP_K = 10           # 向量召回 top-10
+BM25_TOP_K = 10          # BM25 召回 top-10
+SIM_WATERMARK = 0.62     # 向量 / BM25 双方 sim 阈值（确值）
+DUAL_CHANNEL_BOOST = 1.5  # vec ∩ bm25 双通道命中加权
+SINGLE_CHANNEL_PENALTY = 0.7  # 单通道命中减权
 
 # ── 模型探活 + 智能拉起 ───────────────────────────────────────
 # 端口 up ≠ 模型就绪。idle timeout 后进程还在但模型已卸载。
@@ -593,8 +607,55 @@ def _graph_channel_with_sim(query, limit=5):
 
 
 # ============================================================
-# L0 独立 BM25（保持不变，不进主流程）
+# 通道融合：vec ∩ bm25 双通道加权 + Neo4j 实体软过滤加权
 # ============================================================
+
+def _fuse_three_channels(vec_items, bm25_items, graph_entity_names):
+    """三通道融合。
+    设计：
+      1. 按 summary[:60] 去重合并 vec / bm25 命中
+      2. 双通道命中（vec ∩ bm25）→ sort_key × DUAL_CHANNEL_BOOST
+      3. 单通道命中 → sort_key × SINGLE_CHANNEL_PENALTY
+      4. Neo4j 实体命中 → +0.3 软加权（不参与的排在后）
+    返回 list[dict]，每项含 _channels 列表供 fusion_boost_graph_hits 使用。
+    """
+    by_key = {}
+    for it in (vec_items or []):
+        key = (it.get("summary") or "")[:60].strip()
+        if not key:
+            continue
+        if key not in by_key:
+            it["sort_key"] = float(it.get("score", 0))
+            it["_channels"] = ["vec"]
+            by_key[key] = it
+    for it in (bm25_items or []):
+        key = (it.get("summary") or "")[:60].strip()
+        if not key:
+            continue
+        if key in by_key:
+            # 双通道命中：加权
+            by_key[key]["_channels"].append("bm25")
+            by_key[key]["sort_key"] = by_key[key]["sort_key"] * DUAL_CHANNEL_BOOST
+        else:
+            it["sort_key"] = float(it.get("score", 0)) * SINGLE_CHANNEL_PENALTY
+            it["_channels"] = ["bm25"]
+            by_key[key] = it
+
+    fused = list(by_key.values())
+
+    # Neo4j 实体软过滤加权
+    if graph_entity_names:
+        ent_set = {e.strip().lower() for e in graph_entity_names if e}
+        for it in fused:
+            summary_lower = (it.get("summary") or "").lower()
+            item_ents = {e.strip().lower() for e in (it.get("entities") or []) if e}
+            # summary 里命中 OR payload.entities 命中 → 视为图谱相关
+            hit = any(e in summary_lower for e in ent_set) or bool(ent_set & item_ents)
+            if hit:
+                it["sort_key"] = it["sort_key"] + 0.3
+
+    fused.sort(key=lambda x: -float(x.get("sort_key", 0)))
+    return fused
 
 _l0_index_lock = threading.Lock()
 
@@ -848,14 +909,8 @@ def recall_4layer(query, top_k=5, layers=None):
                         graph_entity_names.append(obj)
             graph_prf_triggered = True
 
-    # ── Step 4: 向量召回（无条件，单一路径，top 20，水位 0.62）────────────
-    # 设计意图：
-    #   - 不再有"Path A / Path B"分支（这是我之前臆想的）
-    #   - 统一走纯向量召回，entity filter 不再是硬过滤（删）
-    #   - top_k = 20（在 0.62 水位基础上保证候选充足）
-    #   - 召回范围 = RecallConfig.COLLECTIONS（保持原有 L1 collection 集合）
-    atom = []
-    vec = None
+    # ── Step 4-A: 向量召回（top 10，水位 0.62）──────────────────
+    vec_items = []
     if "L1" in layers:
         try:
             vecs = embed(query)
@@ -867,9 +922,7 @@ def recall_4layer(query, top_k=5, layers=None):
             vecs = []
 
         if vecs and vec is not None:
-            # 统一走纯向量召回，无 entity 硬过滤
             try:
-                from process_dream import _qdrant_client
                 client = _qdrant_client()
                 hits_raw = []
                 for coll in RecallConfig.COLLECTIONS:
@@ -877,8 +930,8 @@ def recall_4layer(query, top_k=5, layers=None):
                         resp = client.query_points(
                             collection_name=coll,
                             query=vec,
-                            limit=20,                        # top 20
-                            score_threshold=0.62,            # 水位 0.62 不动
+                            limit=VEC_TOP_K,
+                            score_threshold=SIM_WATERMARK,
                         )
                         for hit in resp.points:
                             hits_raw.append({
@@ -889,16 +942,63 @@ def recall_4layer(query, top_k=5, layers=None):
                             })
                     except Exception as e:
                         print(f"[warn] vec recall {coll}: {e}", file=sys.stderr)
-                items = _build_l1_items_from_hits(hits_raw)
+                vec_items = _build_l1_items_from_hits(hits_raw)
             except Exception as e:
                 print(f"[warn] vec recall failed: {e}", file=sys.stderr)
-                items = []
 
-            # entity overlap 只作辅助信号填字段，不影响 L1 排序
-            if filter_entities and items:
-                items = _compute_entity_overlap(items, filter_entities)
+            # entity overlap 只作辅助信号填字段
+            if filter_entities and vec_items:
+                vec_items = _compute_entity_overlap(vec_items, filter_entities)
 
-            atom = items[:20]   # top 20
+    # ── Step 4-B: BM25 召回（top 10，0.62 阈值通过 norm_score 过滤）────
+    bm25_items = []
+    if "L1" in layers and BM25_AVAILABLE and _bm25_search is not None:
+        try:
+            bm25_raw = _bm25_search(query, top_k=BM25_TOP_K)
+            for r in bm25_raw:
+                # BM25 的 norm_score 是 0~1，0.62 阈值过滤
+                if r.get("norm_score", 0) < SIM_WATERMARK:
+                    continue
+                pl = r.get("payload") or {}
+                bm25_items.append({
+                    "summary": r.get("summary", ""),
+                    "relation": pl.get("memory_type", ""),
+                    "score": float(r.get("norm_score", 0)),
+                    "norm_score": float(r.get("norm_score", 0)),
+                    "source": "bm25",
+                    "collection": r.get("collection", ""),
+                    "_qdrant_pid": r.get("pid"),
+                    "importance": pl.get("importance", 0.5),
+                    "ts": pl.get("ts", ""),
+                    "tags": pl.get("tags") or [],
+                    "entities": _entities_from_payload(pl),
+                    "scenario_id": pl.get("scenario_id") or pl.get("title") or "",
+                    "event_time": pl.get("event_time") or {},
+                    "valid_time": pl.get("valid_time") or {},
+                    "recorded_at": pl.get("recorded_at") or "",
+                    "source_time": pl.get("source_time") or "",
+                })
+        except Exception as e:
+            print(f"[warn] bm25 recall failed: {e}", file=sys.stderr)
+
+    # ── Step 4-C: Neo4j 图召回（一跳实体扩展）───────────────────────
+    # 提取 graph_entity_names 用作 Step 4-D 的软过滤加权
+    graph_entity_names = []
+    if "L1" in layers:
+        try:
+            entity_names = neo4j_entity_search(query, limit=5)
+            if entity_names:
+                graph_entity_names = [n for n in entity_names if n]
+        except Exception as e:
+            print(f"[warn] neo4j entity search failed: {e}", file=sys.stderr)
+
+    # ── Step 4-D: 三通道融合（vec + bm25 + Neo4j 软过滤加权）───────────
+    # 规则：
+    #   - 按 summary[:60] 去重合并 vec / bm25 命中
+    #   - 双通道命中（vec ∩ bm25）→ sort_key × DUAL_CHANNEL_BOOST
+    #   - 单通道命中 → sort_key × SINGLE_CHANNEL_PENALTY
+    #   - Neo4j 实体命中 → 软过滤加权（命中则 +0.3，未命中不扣分但排序靠后）
+    atom = _fuse_three_channels(vec_items, bm25_items, graph_entity_names)
 
     # ── Step 4.5: L3/L2 召回结果 → 追溯到 L1 records ────────────────
     # 设计意图：上层命中只是为了路由，最终输出必须是 L1。
