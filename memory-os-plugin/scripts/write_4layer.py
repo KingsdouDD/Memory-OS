@@ -37,6 +37,9 @@ if _BRIDGE_PATH not in sys.path:
 from dedup_bridge import dedup_decide_layer_action as _rule_decide_layer_action
 from recall_config import RecallConfig
 
+# 写入层去重决策（规则实现，future 可升级为 LLM 语义判断）
+from dedup_bridge import dedup_decide_layer_action as _rule_decide_layer_action
+
 CN_TZ = timezone(timedelta(hours=8))
 NEO4J_URI = os.environ.get("MEMORY_OS_NEO4J_URI", "bolt://127.0.0.1:7687")
 NEO4J_USER = os.environ.get("MEMORY_OS_NEO4J_USER", "neo4j")
@@ -88,9 +91,15 @@ def _now_cn_str():
 
 
 def _gen_pid_layer(text, layer):
-    """L2/L3 独立 PID（前缀带层名，避免与 L1 撞车）。"""
+    """L2/L3 独立 PID（前缀带层名，避免与 L1 撞车）。
+    
+    坑：hexdigest()[:16] 是 64bit → 转 int 超出 Neo4j int64 (2^63-1)
+    改：取前 15 字符 = 60bit，最大值 2^60-1，远小于 int64 上限
+    同一文本重复生成仍然是同一个 PID（确定性 hash）。
+    """
     safe = (text or "").strip()
-    return int(hashlib.md5(f"4layer|{layer}|{safe}".encode()).hexdigest()[:16], 16)
+    # 15 hex chars = 60 bits < int64 max (63 bits)
+    return int(hashlib.md5(f"4layer|{layer}|{safe}".encode()).hexdigest()[:15], 16)
 
 
 def _safe_label(label):
@@ -259,7 +268,7 @@ def write_l2_scenario(scenario, linked_l1_pids=None):
     """写 L2 scenario：Neo4j Scenario 节点 + Qdrant memory_scenario collection。
 
     失败兜底：每一步异常都不抛异常，记录 ok=False。
-    去重逻辑：照搬 L1 的 ANN 三态决策（SKIP / UPDATE / CREATE）。
+    去重逻辑：LLM 语义决策（CREATE / SKIP / INVALIDATE），由 dedup_bridge 提供。
 
     Args:
         scenario: scenario dict

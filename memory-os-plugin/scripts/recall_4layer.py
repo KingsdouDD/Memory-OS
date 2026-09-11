@@ -336,17 +336,14 @@ def _build_l1_items_from_hits(hits):
 
 
 # ============================================================
-# Q2. entity overlap 重排
+# Q2. entity overlap 计算（仅作辅助信号，不进 final_score）
 # ============================================================
 
-def _rerank_by_entity_overlap(items, filter_entities):
-    """用 entity overlap 重排 items。
+def _compute_entity_overlap(items, filter_entities):
+    """给 items 算 entity overlap，填 entity_overlap / combined_score 字段。
 
-    entity overlap 反映"这条 L1 记忆和 L3/L2 上层上下文的关联度"。
-    关联度高的记忆优先展示，即使 sim 分稍低。
-
-    综合分 = sim * (1 - w) + entity_overlap * w
-    w = ENTITY_OVERLAP_WEIGHT（默认 0.3）
+    注意：entity_overlap 只作为辅助信号，不进入最终打分。
+    最终 L1 排序只由 rerank_score + importance 决定。
     """
     if not items:
         return items
@@ -356,14 +353,147 @@ def _rerank_by_entity_overlap(items, filter_entities):
     for it in items:
         sim = float(it.get("score", 0))
         overlap = _entity_overlap(fset, it.get("entities") or [])
-        # 综合分：sim 为主，entity overlap 加持
         it["entity_overlap"] = round(overlap, 3)
+        # combined_score 保留为参考，但不再进 final_score
         it["combined_score"] = round(sim * (1 - w) + overlap * w, 4)
     return items
 
 
 # ============================================================
-# Q3. L3/L2 辅助召回 → 提取 entities/scenario_ids
+# Q3. L0/L2/L3 命中 → 批量追溯到 L1 记录
+# ============================================================
+
+def _resolve_l1_records_from_hits(layer_hits, dedup_pids=None):
+    """上层命中（L0/L2/L3）→ 读 payload.linked_l1_pids → 批量 retrieve L1 记录。
+
+    设计要点：
+      - linked_l1_pids 必须去重（防脏数据重复）
+      - 跨多个 L1 collection 查（payload.entities / importance 都拿到）
+      - 返回标准 L1 item 结构，可直接进 merged_atom
+
+    Args:
+        layer_hits: [{"pid": ..., "score": ..., "layer": "L0"/"L2"/"L3"}, ...]
+        dedup_pids: 已收集的 L1 PID 集合（合并去重用）
+
+    Returns:
+        [{"pid": ..., "summary": ..., "score": ..., "entities": [...], ...}, ...]
+    """
+    if dedup_pids is None:
+        dedup_pids = set()
+
+    # 1. 从所有上层 hit 的 payload 里读 linked_l1_pids，去重
+    l1_pid_to_score = {}  # pid -> 最高分（来自上层 hit）
+    try:
+        client = _qdrant_client()
+        for hit in layer_hits:
+            pid = hit.get("pid")
+            if pid is None:
+                continue
+            try:
+                pid_int = int(pid)
+            except (ValueError, TypeError):
+                continue
+            try:
+                pts = client.retrieve(
+                    collection_name=hit.get("collection") or "",
+                    ids=[pid_int],
+                    with_payload=True,
+                    with_vectors=False,
+                )
+            except Exception:
+                continue
+            if not pts:
+                continue
+            pl = (pts[0].payload or {})
+            raw = pl.get("linked_l1_pids") or []
+            for l1_pid in raw:
+                # 强转 int（去重用）
+                try:
+                    l1_pid_norm = int(l1_pid)
+                except (ValueError, TypeError):
+                    l1_pid_norm = l1_pid
+                if l1_pid_norm in dedup_pids:
+                    continue
+                # 保留上层最高分作为初始分
+                cur = l1_pid_to_score.get(l1_pid_norm)
+                hit_score = float(hit.get("score", 0))
+                if cur is None or hit_score > cur:
+                    l1_pid_to_score[l1_pid_norm] = hit_score
+    except Exception as e:
+        print(f"[warn] _resolve_l1: read linked_l1_pids failed: {e}", file=sys.stderr)
+        return []
+
+    if not l1_pid_to_score:
+        return []
+
+    # 2. 批量 retrieve L1 记录
+    l1_items = []
+    try:
+        client = _qdrant_client()
+        all_l1_pids = list(l1_pid_to_score.keys())
+        # 拆分 int / string（Qdrant point id 类型）
+        int_pids = [p for p in all_l1_pids if isinstance(p, int)]
+        str_pids = [p for p in all_l1_pids if not isinstance(p, int)]
+
+        retrieved = {}  # pid -> point
+        for coll in RecallConfig.COLLECTIONS:
+            if int_pids:
+                try:
+                    for pt in client.retrieve(
+                        collection_name=coll, ids=int_pids,
+                        with_payload=True, with_vectors=False,
+                    ):
+                        retrieved[pt.id] = pt
+                except Exception:
+                    pass
+            if str_pids:
+                try:
+                    for pt in client.retrieve(
+                        collection_name=coll, ids=str_pids,
+                        with_payload=True, with_vectors=False,
+                    ):
+                        retrieved[str(pt.id)] = pt
+                except Exception:
+                    pass
+
+        # 3. 构造标准 L1 item
+        for l1_pid, parent_score in l1_pid_to_score.items():
+            pt = retrieved.get(l1_pid)
+            if pt is None:
+                continue
+            pl = pt.payload or {}
+            summary = pl.get("summary") or pl.get("text") or ""
+            if not summary:
+                continue
+            l1_items.append({
+                "summary": summary,
+                "relation": pl.get("memory_type", ""),
+                "score": parent_score,
+                "source": "l0l2l3_resolved",
+                "collection": (pt.id and
+                              next((c for c in RecallConfig.COLLECTIONS
+                                    if True), "")),
+                "_qdrant_pid": pt.id,
+                "importance": pl.get("importance", 0.5),
+                "ts": pl.get("ts", ""),
+                "tags": pl.get("tags") or [],
+                "entities": _entities_from_payload(pl),
+                "scenario_id": pl.get("scenario_id") or pl.get("title") or "",
+                "event_time": pl.get("event_time") or {},
+                "valid_time": pl.get("valid_time") or {},
+                "recorded_at": pl.get("recorded_at") or "",
+                "source_time": pl.get("source_time") or "",
+                "recall_reason": f"由上层 L 命中追溯",
+            })
+            dedup_pids.add(l1_pid)
+    except Exception as e:
+        print(f"[warn] _resolve_l1: retrieve L1 records failed: {e}", file=sys.stderr)
+
+    return l1_items
+
+
+# ============================================================
+# Q4. L3/L2 辅助召回 → 提取 entities/scenario_ids
 # ============================================================
 
 def _collect_context_from_layer(query, collection, min_score, top_k):
@@ -629,26 +759,29 @@ def recall_4layer(query, top_k=5, layers=None):
     persona, scenario = [], []
     filter_entities = []
     filter_scenario_ids = []
+    l1_resolved_seen = set()  # L1 PID 去重池（追溯 + 向量召回 都进这里）
 
-    # ── Step 1: L3 召回（高置信），提取 entities ─────────────────
+    # ── Step 1: L3 召回（高置信），追溯到 L1 ─────────────────
     if "L3" in layers:
         entities, sids, hits = _collect_context_from_layer(
             query, L3_COLLECTION, min_score=L3_MIN_SCORE, top_k=top_k
         )
         for h in hits:
             h["layer"] = "L3"
+            h["collection"] = L3_COLLECTION
             persona.append(h)
         for e in entities:
             if e and e not in filter_entities:
                 filter_entities.append(e)
 
-    # ── Step 2: L2 召回（中高置信），提取 entities + scenario_ids ──
+    # ── Step 2: L2 召回（中高置信），追溯到 L1 ──
     if "L2" in layers:
         entities, sids, hits = _collect_context_from_layer(
             query, L2_COLLECTION, min_score=L2_MIN_SCORE, top_k=top_k
         )
         for h in hits:
             h["layer"] = "L2"
+            h["collection"] = L2_COLLECTION
             scenario.append(h)
         for e in entities:
             if e and e not in filter_entities:
@@ -761,12 +894,27 @@ def recall_4layer(query, top_k=5, layers=None):
                 print(f"[warn] vec recall failed: {e}", file=sys.stderr)
                 items = []
 
-            # entity overlap 重排保留（entity overlap 作为加权信号，不是硬过滤）
+            # entity overlap 只作辅助信号填字段，不影响 L1 排序
             if filter_entities and items:
-                items = _rerank_by_entity_overlap(items, filter_entities)
-                items.sort(key=lambda x: -x.get("combined_score", x.get("score", 0)))
+                items = _compute_entity_overlap(items, filter_entities)
 
             atom = items[:20]   # top 20
+
+    # ── Step 4.5: L3/L2 召回结果 → 追溯到 L1 records ────────────────
+    # 设计意图：上层命中只是为了路由，最终输出必须是 L1。
+    # 逐个读 L0/L2/L3 hit 的 payload.linked_l1_pids，批量 retrieve L1。
+    # 写入侧可能在同一上层记录里重复同一 PID（脏数据），这里强制去重。
+    if "L1" in layers:
+        upper_layer_hits = []
+        for h in persona:
+            upper_layer_hits.append({**h, "collection": L3_COLLECTION})
+        for h in scenario:
+            upper_layer_hits.append({**h, "collection": L2_COLLECTION})
+        if upper_layer_hits:
+            resolved_l1_items = _resolve_l1_records_from_hits(
+                upper_layer_hits, dedup_pids=l1_resolved_seen
+            )
+            atom.extend(resolved_l1_items)
 
     # ── Step 5: 已删除（与 Step 4 entity overlap 重排重复）──────────
     # 保留 Step 4 里的 entity overlap 重排一次即可
@@ -897,10 +1045,12 @@ def recall_4layer(query, top_k=5, layers=None):
         for i, m in enumerate(merged_atom):
             rr = rerank_map.get(i, 0.0)
             m["rerank_score"] = rr
-            # 联想记忆不再进 merged_atom
-            # 所以只走 entity_overlap 分支
+            # A 方案：final_score 只由 rerank_score + importance 决定
+            # entity_overlap 不进打分（上层 entities 不再影响 L1 排序）
+            # importance 作为轻微加权（重要记忆优先）
+            importance = float(m.get("importance", 0.5))
             m["final_score"] = round(
-                rr * 0.6 + m.get("entity_overlap", 0) * 0.4,
+                rr * 0.9 + importance * 0.1,
                 4,
             )
 
@@ -918,22 +1068,17 @@ def recall_4layer(query, top_k=5, layers=None):
         sum(m.get("entity_overlap", 0) for m in merged_atom) / max(len(merged_atom), 1)
     )
 
+    # A 方案：返回结构精简，只保留 L1 输出 + 必要调试计数
+    # 删 _aux_persona/_aux_scenario/filter_entities/filter_scenario_ids
+    # 删 assoc_candidates/raw（中间过程数据）
     return {
         "query": query,
         "layers": layers,
-        # L3/L2 只做 filter，不进最终输出
-        "_aux_persona": persona,
-        "_aux_scenario": scenario,
         "atom": merged_atom,
-        "assoc_candidates": assoc_candidates if assoc_triggered else [],
-        "raw": [],
         "memories": all_memories,
         "context": {
-            "filter_entities": filter_entities,
-            "filter_scenario_ids": filter_scenario_ids,
+            "l1_atom_count": len(merged_atom),
             "graph_prf_triggered": graph_prf_triggered,
-            "assoc_triggered": assoc_triggered,
-            "assoc_candidate_count": len(assoc_candidates),
             "entity_overlap_avg": round(overlap_avg, 3),
         },
     }
@@ -966,25 +1111,12 @@ def recall_for_hook(query, top_k=8, rrf_k=None):
     memories = [m for m in memories if m]
 
     ctx = result.get("context", {})
-    assoc_cands = result.get("assoc_candidates") or []
-    # 统计联想来源的记忆条数
-    assoc_mem_count = sum(1 for m in atom if m.get("_is_assoc"))
+    # A 方案：channels 只保留与 L1 输出相关的计数
     channels = {
-        "vec": 0,
-        "bm25": 0,
-        "bm25_kw_filtered": 0,
-        "graph": 0,
-        "prf_kg_summaries": 0,
         "rrf_k": rrf_k or 60,
-        "aux_persona": len(result.get("_aux_persona", []) or result.get("persona", [])),
-        "aux_scenario": len(result.get("_aux_scenario", []) or result.get("scenario", [])),
-        "l1_atom_count": len(atom),
-        "assoc_count": assoc_mem_count,
-        "assoc_candidates": ctx.get("assoc_candidate_count", 0),
+        "l1_atom_count": ctx.get("l1_atom_count", len(atom)),
         "graph_prf_triggered": ctx.get("graph_prf_triggered", False),
-        "assoc_triggered": ctx.get("assoc_triggered", False),
         "entity_overlap_avg": ctx.get("entity_overlap_avg", 0),
-        "filter_entities": ctx.get("filter_entities", [])[:5],
     }
 
     return {
