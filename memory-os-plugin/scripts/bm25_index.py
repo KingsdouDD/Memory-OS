@@ -37,7 +37,8 @@ except ImportError:
     BM25Okapi = None
 
 
-INDEX_DIR = Path("/tmp")
+INDEX_DIR = Path(os.path.expanduser("~/.openclaw/workspace/memory-os/data"))
+INDEX_DIR.mkdir(parents=True, exist_ok=True)
 INDEX_FILE = INDEX_DIR / "memory_os_bm25.pkl"
 BM25_K1 = 1.5
 BM25_B = 0.75
