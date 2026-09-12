@@ -1155,7 +1155,7 @@ def recall_4layer(query, top_k=5, layers=None):
             )
 
     merged_atom.sort(key=lambda x: -x.get("final_score", x.get("score", 0)))
-    merged_atom = [m for m in merged_atom if (m.get("rerank_score") or 0) >= 0.55]
+    merged_atom = [m for m in merged_atom if (m.get("rerank_score") or 0) >= 0.95]
     merged_atom = merged_atom[:top_k]
 
     all_memories = [_format_memory_with_time(m) for m in merged_atom if m.get("summary")]

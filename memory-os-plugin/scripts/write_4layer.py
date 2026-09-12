@@ -130,7 +130,7 @@ def write_l0_conversation(l0_payload, l1_kos=None, linked_l1_pids=None):
     if not scene_summary:
         return {"layer": "L0", "skipped": True, "reason": "缺少 scene_summary"}
 
-    # ---- 0. ANN 去重决策（LLM 语义判断）----
+    # ---- 0. L0 去重决策（2026-09-12 老豆决定：只对比 L0，LLM 纯字面对比）----
     candidates = _ann_find_candidates_in_collection(L0_COLLECTION, scene_summary, top_k=5)
     action, reason = _rule_decide_layer_action(l0_payload.get("state"), candidates, layer="L0", new_text=scene_summary)
     if action == "SKIP":
@@ -287,30 +287,8 @@ def write_l2_scenario(scenario, linked_l1_pids=None):
     entities = scenario.get("entities") or []
     scenario_id = title or summary[:50]
 
-    # ---- 0. ANN 去重决策（仿 L1 _rule_decide_action）----
-    ann_text = f"{title} {summary}"
-    candidates = _ann_find_candidates_in_collection(L2_COLLECTION, ann_text, top_k=5)
-    action, reason = _rule_decide_layer_action(scenario.get("state"), candidates, layer="L2", new_text=ann_text)
-    if action == "SKIP":
-        return {"layer": "L2", "skipped": True, "reason": f"dup: {reason}",
-                "scenario_id": scenario_id, "action": "SKIP"}
-    if action == "DISCARD":
-        return {"layer": "L2", "skipped": True, "reason": reason}
-    if action == "INVALIDATE":
-        # state=uncertain 有候选 → 标记旧 scenario 为 uncertain
-        try:
-            client = _qdrant_client()
-            old_pts = client.retrieve(collection_name=L2_COLLECTION, ids=[candidates[0]["pid"]])
-            if old_pts:
-                old_pl = old_pts[0].payload or {}
-                old_pl["state"] = "uncertain"
-                old_pl["updated"] = _now_cn_iso()
-                client.upsert(collection_name=L2_COLLECTION,
-                              points=[{"id": candidates[0]["pid"], "vector": [0.0]*1024, "payload": old_pl}])
-        except Exception as e:
-            print(f"[warn] L2 invalidate old failed: {e}", file=sys.stderr)
-        return {"layer": "L2", "skipped": True, "reason": f"invalidate old: {reason}",
-                "action": "INVALIDATE"}
+    # ---- 0. L2 不做去重（2026-09-12 老豆决定：只有 L0 做去重对比）----
+    # ---- 1. Neo4j: Scenario 节点 + 实体关联 ----
 
     # ---- 1. Neo4j: Scenario 节点 + 实体关联 ----
     neo4j_ok = False
@@ -439,29 +417,7 @@ def write_l3_personas(personas, linked_l1_pids=None):
         p = _normalize_time_fields(p, source_path=None)
         p["layer"] = "L3"
 
-        # ---- ANN 去重决策（LLM 语义判断）----
-        candidates = _ann_find_candidates_in_collection(L3_COLLECTION, summary, top_k=5)
-        action, reason = _rule_decide_layer_action(p.get("state"), candidates, layer="L3", new_text=summary)
-        if action == "SKIP":
-            results.append({"layer": "L3", "skipped": True, "reason": f"dup: {reason}", "summary": summary[:60], "action": "SKIP"})
-            continue
-        if action == "DISCARD":
-            results.append({"layer": "L3", "skipped": True, "reason": reason, "summary": summary[:60]})
-            continue
-        if action == "INVALIDATE":
-            try:
-                client = _qdrant_client()
-                old_pts = client.retrieve(collection_name=L3_COLLECTION, ids=[candidates[0]["pid"]])
-                if old_pts:
-                    old_pl = old_pts[0].payload or {}
-                    old_pl["state"] = "uncertain"
-                    old_pl["updated"] = _now_cn_iso()
-                    client.upsert(collection_name=L3_COLLECTION,
-                                  points=[{"id": candidates[0]["pid"], "vector": [0.0]*1024, "payload": old_pl}])
-            except Exception as e:
-                print(f"[warn] L3 invalidate old failed: {e}", file=sys.stderr)
-            results.append({"layer": "L3", "skipped": True, "reason": f"invalidate old: {reason}", "summary": summary[:60]})
-            continue
+        # ---- L3 不做去重（2026-09-12 老豆决定：只有 L0 做去重对比）----
 
         # ---- 1. Neo4j Persona 节点 ----
         neo4j_ok = False
@@ -576,19 +532,53 @@ def write_4layer(payload):
 
     # 拆 4 层（l0/l1/l2/l3 都允许为空）
     l0 = payload.get("l0") or {}
+    # L1：新格式是单个对象 {type,summary,...}，旧格式是 {kos:[...]}
     l1_block = payload.get("l1") or {}
-    l1_kos = l1_block.get("kos") or [] if isinstance(l1_block, dict) else []
+    if isinstance(l1_block, dict) and "kos" in l1_block:
+        l1_kos = l1_block.get("kos") or []
+    elif isinstance(l1_block, dict) and l1_block.get("summary"):
+        # 新格式：L1 是单个 KO 对象
+        l1_kos = [l1_block]
+    else:
+        l1_kos = []
     l2_block = payload.get("l2") or {}
     l2_scenario = l2_block.get("scenario") if isinstance(l2_block, dict) else None
     l3_block = payload.get("l3") or {}
     l3_personas = l3_block.get("persona") or [] if isinstance(l3_block, dict) else []
 
     report = {"l0": None, "l1": None, "l2": None, "l3": None}
-    # 🔧 2026-09-09 PID 级联追溯改造：L1 先写拿到 PID，L0/L2/L3 拿这些 PID 写入
+    # 🔧 2026-09-12 PID 级联追溯改造：L1 先写拿到 PID，L0/L2/L3 拿这些 PID 写入
     l1_pids = []  # 收集本批 L1 的 PID，传给 L0/L2/L3
     l1_report = {}
 
-    # 1) L1 先写（拿到 PID，供 L0/L2/L3 反向关联用）
+    # 0) L0 判重（不写，只判。SKIP 则整条不写）
+    if l0 and l0.get("scene_summary"):
+        scene_summary = (l0.get("scene_summary") or "").strip()
+        candidates = _ann_find_candidates_in_collection(L0_COLLECTION, scene_summary, top_k=5)
+        action, reason = _rule_decide_layer_action(l0.get("state"), candidates, layer="L0", new_text=scene_summary)
+        if action == "SKIP":
+            report["l0"] = {"layer": "L0", "skipped": True, "reason": f"dup: {reason}",
+                             "l0_id": str(candidates[0]["pid"]) if candidates else None, "action": "SKIP"}
+            return report
+        if action == "DISCARD":
+            report["l0"] = {"layer": "L0", "skipped": True, "reason": reason, "action": "DISCARD"}
+            return report
+        if action == "INVALIDATE":
+            # 使旧记录失效 + 继续写入新记录
+            try:
+                client = _qdrant_client()
+                from qdrant_client import QdrantClient
+                from memory_os_plugin.src.qdrant_helper import qdrant_upsert_point
+                old_pts = client.retrieve(collection_name=L0_COLLECTION, ids=[candidates[0]["pid"]])
+                if old_pts:
+                    old_pl = old_pts[0].payload or {}
+                    old_pl["state"] = "uncertain"
+                    old_pl["updated"] = _now_cn_iso()
+                    qdrant_upsert_point(client, L0_COLLECTION, candidates[0]["pid"], [0.0]*1024, old_pl)
+            except Exception as e:
+                print(f"[warn] L0 invalidate failed: {e}", file=sys.stderr)
+
+    # 1) L1 先写（拿到 PID）
     if l1_kos:
         try:
             l1_result = write_kos_v5_return_pids(l1_kos)
@@ -598,15 +588,16 @@ def write_4layer(payload):
         except Exception as e:
             report["l1"] = {"error": str(e)}
 
-    # 2) L0 带 linked_l1_pids 写入（同时传 l1_kos 用于 Neo4j GENERATED 边）
+    # 2) L0 写入（关联 L1 PID）
     if l0 and l0.get("scene_summary"):
-        report["l0"] = write_l0_conversation(l0, l1_kos=l1_kos, linked_l1_pids=l1_pids)
+        l0_result = write_l0_conversation(l0, l1_kos=l1_kos, linked_l1_pids=l1_pids)
+        report["l0"] = l0_result
 
-    # 3) L2 带 linked_l1_pids 写入
+    # 3) L2 写入（关联 L1 PID）
     if l2_scenario:
         report["l2"] = write_l2_scenario(l2_scenario, linked_l1_pids=l1_pids)
 
-    # 4) L3 带 linked_l1_pids 写入
+    # 4) L3 写入（关联 L1 PID）
     if l3_personas:
         report["l3"] = write_l3_personas(l3_personas, linked_l1_pids=l1_pids)
 
@@ -956,7 +947,13 @@ def confirm_update_4layer(token, selected_pids=None, new_memory=None):
     updated = {}
     try:
         if target_layer == "L1":
-            l1_kos = (new_memory.get("l1") or {}).get("kos") or []
+            l1_block = new_memory.get("l1") or {}
+            if isinstance(l1_block, dict) and "kos" in l1_block:
+                l1_kos = l1_block.get("kos") or []
+            elif isinstance(l1_block, dict) and l1_block.get("summary"):
+                l1_kos = [l1_block]
+            else:
+                l1_kos = []
             if l1_kos:
                 from process_dream import _execute_update_v5
                 client = _qdrant_client()
@@ -985,7 +982,14 @@ def confirm_update_4layer(token, selected_pids=None, new_memory=None):
         elif target_layer == "L0":
             l0 = new_memory.get("l0")
             if l0:
-                result = write_l0_conversation(l0, l1_kos=(new_memory.get("l1") or {}).get("kos"))
+                l1_block = new_memory.get("l1") or {}
+                if isinstance(l1_block, dict) and "kos" in l1_block:
+                    l1_kos = l1_block.get("kos") or []
+                elif isinstance(l1_block, dict) and l1_block.get("summary"):
+                    l1_kos = [l1_block]
+                else:
+                    l1_kos = []
+                result = write_l0_conversation(l0, l1_kos=l1_kos)
                 if result.get("neo4j_ok") and result.get("qdrant_ok"):
                     client = _qdrant_client()
                     _qdrant_delete_point(client, L0_COLLECTION, target_pid)

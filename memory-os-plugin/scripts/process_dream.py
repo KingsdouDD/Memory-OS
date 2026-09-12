@@ -1550,39 +1550,20 @@ def _ann_find_candidates(client, collection, ko, top_k=None):
 
 
 def _rule_decide_action(ko, candidates):
-    """规则决策（无 LLM）：基于 ANN 分数 + KO.state 字段判断操作类型。
-    - 无候选 → CREATE
-    - 新 KO state=uncertain → INVALIDATE（有疑虑，不新建）
-    - 新 KO state=historical + 有候选 → UPDATE（旧状态标记历史，新写当前）
-    - 最高分 >= DEDUP_THRESHOLD → SKIP（几乎一样，跳过）
-    - 最高分 >= WRITE_ANN_RECALL_THRESHOLD → UPDATE:1（相似，merge 补充信息）
-    - 否则 → CREATE
+    """决策入口（2026-09-12 老豆决定）：统一走 LLM 语义去重，不做 ANN 合并。
+    委托给 dedup_bridge.dedup_decide_layer_action，不再返回 UPDATE/OVERRIDE。
     """
-    # 新 KO 的 state 字段判断（来自新 extract_prompt.md）
+    from dedup_bridge import dedup_decide_layer_action
     state = ko.get("state", "active")
-
-    if not candidates:
-        # 无候选：state=uncertain 也不写，其他都 CREATE
-        if state == "uncertain":
-            return "DISCARD", f"state=uncertain, no candidates, discarded"
-        return "CREATE", "no candidates"
-
-    best = max(candidates, key=lambda c: c.get("score", 0))
-    score = float(best.get("score", 0))
-
-    # state=uncertain：有候选但新信息不确定，标记旧记录为 uncertain
-    if state == "uncertain":
-        return "INVALIDATE", f"state=uncertain, score={score:.3f}, invalidate old"
-
-    # state=historical：有候选，说明库里有旧记录，标记旧为历史再写新
-    if state == "historical":
-        return "UPDATE:1", f"state=historical, score={score:.3f}, update old to historical"
-
-    if score >= RecallConfig.DEDUP_THRESHOLD:
-        return "SKIP", f"dup score={score:.3f} >= {RecallConfig.DEDUP_THRESHOLD}"
-    if score >= RecallConfig.WRITE_ANN_RECALL_THRESHOLD:
-        return "UPDATE:1", f"similar score={score:.3f}, merge supplement"
-    return "CREATE", f"new score={score:.3f} < recall threshold"
+    new_text = (ko.get("summary") or "").strip()
+    action, reason = dedup_decide_layer_action(
+        state=state,
+        candidates=candidates,
+        layer="L1",
+        new_text=new_text,
+    )
+    # 兼容 INVALIDATE / DISCARD 返回值
+    return action, reason
 
 
 def _log_decision(action, reason, ko, candidates):
@@ -1916,8 +1897,9 @@ def write_kos_v5_return_pids(kos):
                 except Exception as e:
                     print(f"[warn] ensure collection {collection}: {e}", file=sys.stderr)
 
-            candidates = _ann_find_candidates(client, collection, ko_inner)
-            action, reason = _rule_decide_action(ko_inner, candidates)
+            # L1 不做去重（2026-09-12 老豆决定：只对比 L0）
+            # 直接 CREATE，每条 KO 独立一条 L1
+            # 不写 decision 日志（避免噪声）
 
             # PID 预计算：纯函数，同 KO 同 PID
             try:
@@ -1926,37 +1908,8 @@ def write_kos_v5_return_pids(kos):
                 print(f"[warn] _gen_pid_v5 failed: {e}", file=sys.stderr)
                 pid = None
 
-            if action == "CREATE":
-                report["create"] += 1
-                _execute_create_v5(ko_inner, kotype, collection, client, report)
-            elif action == "SKIP":
-                report["skipped"] += 1
-            elif action.startswith("UPDATE:"):
-                idx = int(action.split(":", 1)[1]) - 1
-                if 0 <= idx < len(candidates):
-                    cand = candidates[idx]
-                    report["update"] += 1
-                    # 覆盖 pid：UPDATE 的 PID 是候选的，不是新生成的
-                    pid = cand.get("pid") or pid
-                    _execute_update_v5(ko_inner, kotype, cand.get("collection", collection), client, cand["pid"], report)
-                else:
-                    report["errors"] += 1
-                    print(f"[warn] UPDATE 序号越界: {action} (candidates={len(candidates)})", file=sys.stderr)
-            elif action.startswith("OVERRIDE:"):
-                idx = int(action.split(":", 1)[1]) - 1
-                if 0 <= idx < len(candidates):
-                    cand = candidates[idx]
-                    report["override"] += 1
-                    pid = cand.get("pid") or pid
-                    _execute_override_v5(ko_inner, kotype, cand.get("collection", collection), client, cand["pid"], report)
-                else:
-                    report["errors"] += 1
-                    print(f"[warn] OVERRIDE 序号越界: {action} (candidates={len(candidates)})", file=sys.stderr)
-            else:
-                report["create"] += 1
-                _execute_create_v5(ko_inner, kotype, collection, client, report)
-
-            _log_decision(action, reason, ko_inner, candidates)
+            report["create"] += 1
+            _execute_create_v5(ko_inner, kotype, collection, client, report)
 
             if pid is not None:
                 result["pids"].append(str(pid))
@@ -2001,35 +1954,18 @@ def write_kos_v5(kos):
                     print(f"[warn] ensure collection {collection}: {e}", file=sys.stderr)
 
             candidates = _ann_find_candidates(client, collection, ko)
-            action, reason = _rule_decide_action(ko, candidates)
-
             if action == "CREATE":
                 report["create"] += 1
                 _execute_create_v5(ko, kotype, collection, client, report)
             elif action == "SKIP":
                 report["skipped"] += 1
-            elif action.startswith("UPDATE:"):
-                # 🔧 2026-08-10 修复：UPDATE:N 的 N 是候选序号（1-based），
-                # 不是 pid！原来 int("1")=1 直接当 pid 用，写到错误的 point。
-                # 现在映射回候选的 pid + collection（跨库候选必须写回原 collection）。
-                idx = int(action.split(":", 1)[1]) - 1
-                if 0 <= idx < len(candidates):
-                    cand = candidates[idx]
-                    report["update"] += 1
-                    _execute_update_v5(ko, kotype, cand.get("collection", collection), client, cand["pid"], report)
-                else:
-                    report["errors"] += 1
-                    print(f"[warn] UPDATE 序号越界: {action} (candidates={len(candidates)})", file=sys.stderr)
-            elif action.startswith("OVERRIDE:"):
-                idx = int(action.split(":", 1)[1]) - 1
-                if 0 <= idx < len(candidates):
-                    cand = candidates[idx]
-                    report["override"] += 1
-                    _execute_override_v5(ko, kotype, cand.get("collection", collection), client, cand["pid"], report)
-                else:
-                    report["errors"] += 1
-                    print(f"[warn] OVERRIDE 序号越界: {action} (candidates={len(candidates)})", file=sys.stderr)
+            elif action == "DISCARD":
+                report["skipped"] += 1
+                print(f"[info] discarded: {ko.get('summary', '')[:60]}", file=sys.stderr)
+            elif action == "INVALIDATE":
+                report["skipped"] += 1
             else:
+                print(f"[warn] unknown action={action}, fallback CREATE: {ko.get('summary', '')[:60]}", file=sys.stderr)
                 report["create"] += 1
                 _execute_create_v5(ko, kotype, collection, client, report)
 
