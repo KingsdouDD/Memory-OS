@@ -519,16 +519,64 @@ def _kw_hit_count(summary, words, prefix=False):
 
 
 def neo4j_entity_search(query_text, limit=8):
-    """按 query 文本分词后逐词 CONTAINS 匹配 Neo4j entity 名字，返回去重后的候选名字列表。
-    使用 jieba 中文分词（fallback 滑动窗口）确保「快乐」这类短词能被切出来。
+    """用 Neo4j Full-text index（Lucene + BM25）搜索实体名。
+
+    🔧 2026-09-16 重构：去掉 jieba + substring CONTAINS 硬匹配，改用 Neo4j 内置全文索引。
+    之前方案（jieba 切词 + any(t IN $tokens WHERE toLower(n.name) CONTAINS toLower(t))）：
+      - 没倒排索引，全表扫描
+      - 没 BM25 评分，靠 contains 判断有/无
+      - 短词切不出来（必须 fallback 滑动窗口）
+
+    新方案（db.index.fulltext.queryNodes）：
+      - 底层是 Apache Lucene + BM25，自动倒排 + 评分 + 排序
+      - 支持 Lucene query syntax（AND/OR/模糊匹配/短语）
+      - 召回更准、速度更快
+
+    返回：按 BM25 score 倒序的去重 entity 名字列表
     """
     from neo4j import GraphDatabase
     driver = GraphDatabase.driver(
         NEO4J_URI,
         auth=(NEO4J_USER, NEO4J_PASSWORD),
-        # 🔧 2026-08-10 修复：老数据缺 event_time_start 等属性，
-        # Neo4j 5+ 对不存在的 property key 发 notification → 每次召回刷几十条 warning。
-        # 查询端已用 coalesce 兜底，notification 纯噪音，关掉。
+        notifications_min_severity="OFF",
+    )
+    seen = set()
+    names = []
+    try:
+        with driver.session() as session:
+            # Neo4j 5.16+ 标准用法：CALL db.index.fulltext.queryNodes
+            # YIELD node, score 自动给出 BM25 分数
+            cypher = """
+            CALL db.index.fulltext.queryNodes('entity_fulltext', $query_text)
+            YIELD node, score
+            RETURN node.name AS name, labels(node) AS labels, score
+            ORDER BY score DESC
+            LIMIT $limit
+            """
+            for rec in session.run(cypher, query_text=query_text, limit=limit).data():
+                name = rec["name"]
+                if not name:
+                    continue
+                key = name.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                names.append(name)
+    except Exception as e:
+        # 索引可能没建（全新部署场景），降级到原 jieba + CONTAINS 方案
+        print(f"[warn] fulltext query failed, fallback to jieba scan: {e}", file=sys.stderr)
+        return _neo4j_entity_search_fallback(query_text, limit=limit)
+    finally:
+        driver.close()
+    return names
+
+
+def _neo4j_entity_search_fallback(query_text, limit=8):
+    """降级方案：索引未建时用 jieba + CONTAINS 硬匹配（仅作为兜底）。"""
+    from neo4j import GraphDatabase
+    driver = GraphDatabase.driver(
+        NEO4J_URI,
+        auth=(NEO4J_USER, NEO4J_PASSWORD),
         notifications_min_severity="OFF",
     )
     seen = set()
@@ -538,7 +586,6 @@ def neo4j_entity_search(query_text, limit=8):
             tokens = _tokenize_for_kg(query_text)
             if not tokens:
                 tokens = [query_text]
-
             cypher = """
             MATCH (n)
             WHERE n.name IS NOT NULL AND any(t in $tokens WHERE toLower(n.name) CONTAINS toLower(t))

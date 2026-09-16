@@ -611,52 +611,116 @@ def _graph_channel_with_sim(query, limit=5):
 # ============================================================
 
 def _fuse_three_channels(vec_items, bm25_items, graph_entity_names):
-    """三通道融合。
-    设计：
-      1. 按 summary[:60] 去重合并 vec / bm25 命中
-      2. 双通道命中（vec ∩ bm25）→ sort_key × DUAL_CHANNEL_BOOST
-      3. 单通道命中 → sort_key × SINGLE_CHANNEL_PENALTY
-      4. Neo4j 实体命中 → +0.3 软加权（不参与的排在后）
-    返回 list[dict]，每项含 _channels 列表供 fusion_boost_graph_hits 使用。
+    """三通道融合（重构版）。
+
+    核心原则：
+      1. 双通道命中 → 主动加权 boost，**永不丢弃**（boost 是信号增强，不是惩罚）
+      2. 单通道命中 → penalty 减权（× 0.3）；减分 ≥ 50% 视为信号失真，**直接丢弃**
+      3. Neo4j 加分有上限：最多补回 penalty_value（不能拉回被 penalty 减掉的部分）
+      4. reranker 只负责排序，不救回融合阶段被丢弃的数据
+
+    减分判断基准：sort_key vs _orig_score
+      - ratio = sort_key / orig
+      - ratio < 0.5 → 减分超 50% → 丢弃
+      - ratio ≥ 0.5 → 保留
     """
+    # 双通道 BM25 有效命中阈值
+    BM25_HIT_THRESHOLD = 0.62
+    # 单通道 penalty 系数（保留 30%）
+    SINGLE_PENALTY = 0.3
+    # 双通道 boost 系数
+    DUAL_BOOST_MULT = 1.8
+    # Neo4j 实体加分上限
+    NEO4J_BOOST_CAP = 0.3
+
     by_key = {}
+
+    # 1) 注册 vec 通道（保留原分用于减分判断）
     for it in (vec_items or []):
         key = (it.get("summary") or "")[:60].strip()
         if not key:
             continue
         if key not in by_key:
-            it["sort_key"] = float(it.get("score", 0))
+            it["_orig_score"] = float(it.get("score", 0))
+            it["sort_key"] = it["_orig_score"]  # 初始 = 原分；bm25 阶段会改写
             it["_channels"] = ["vec"]
             by_key[key] = it
+
+    # 1.5) 预收集 bm25 命中的 key 集合（用于区分真单通道 vs 假单通道）
+    bm25_hit_keys = set()
+    for it in (bm25_items or []):
+        key = (it.get("summary") or "")[:60].strip()
+        if key:
+            bm25_hit_keys.add(key)
+
+    # 2) 处理 bm25 通道
     for it in (bm25_items or []):
         key = (it.get("summary") or "")[:60].strip()
         if not key:
             continue
+
+        bm25_norm = float(it.get("norm_score", 0))
+
         if key in by_key:
-            # 双通道命中：加权
-            by_key[key]["_channels"].append("bm25")
-            by_key[key]["sort_key"] = by_key[key]["sort_key"] * DUAL_CHANNEL_BOOST
+            # vec 已存在 → 判断双通道还是单通道
+            if bm25_norm >= BM25_HIT_THRESHOLD:
+                # 双通道：boost
+                vec_score = by_key[key]["_orig_score"]
+                geo = (vec_score * bm25_norm) ** 0.5
+                by_key[key]["sort_key"] = round(geo * DUAL_BOOST_MULT, 4)
+                by_key[key]["_channels"] = ["vec", "bm25"]
+            else:
+                # bm25 太弱 → 当 vec 单通道处理（减分 70%）
+                by_key[key]["sort_key"] = round(by_key[key]["_orig_score"] * SINGLE_PENALTY, 4)
+                by_key[key]["_channels"] = ["vec"]
         else:
-            it["sort_key"] = float(it.get("score", 0)) * SINGLE_CHANNEL_PENALTY
-            it["_channels"] = ["bm25"]
-            by_key[key] = it
+            # 纯 bm25 单通道
+            if bm25_norm >= BM25_HIT_THRESHOLD:
+                it["_orig_score"] = bm25_norm
+                it["sort_key"] = round(bm25_norm * SINGLE_PENALTY, 4)
+                it["_channels"] = ["bm25"]
+                by_key[key] = it
+            # else: bm25 太弱直接丢弃
 
     fused = list(by_key.values())
 
-    # Neo4j 实体软过滤加权
+    # 3) Neo4j 实体加分（只对单通道；封顶不超过 penalty_value 把减分回补的额度）
     if graph_entity_names:
         ent_set = {e.strip().lower() for e in graph_entity_names if e}
         for it in fused:
+            channels = it.get("_channels", [])
+            if len(channels) > 1:
+                continue  # 双通道不加 Neo4j
             summary_lower = (it.get("summary") or "").lower()
             item_ents = {e.strip().lower() for e in (it.get("entities") or []) if e}
-            # summary 里命中 OR payload.entities 命中 → 视为图谱相关
             hit = any(e in summary_lower for e in ent_set) or bool(ent_set & item_ents)
             if hit:
-                it["sort_key"] = it["sort_key"] + 0.3
+                # Neo4j 命中：加分有上限 NEO4J_BOOST_CAP
+                it["sort_key"] = round(it["sort_key"] + NEO4J_BOOST_CAP, 4)
 
+    # 3.5) vec-only 单通道（bm25 完全没命中过）立即做 penalty 减分
+    #      这部分在 bm25 处理循环里没法处理（因为 bm25 没命中就不进入循环）
+    for it in fused:
+        if len(it.get("_channels", [])) == 1 and it.get("_channels", [""])[0] == "vec":
+            key = (it.get("summary") or "")[:60].strip()
+            if key not in bm25_hit_keys:
+                # 真 vec-only 单通道：减分
+                it["sort_key"] = round(it["_orig_score"] * SINGLE_PENALTY, 4)
+
+    # 4) 减分 ≥ 50% 直接丢弃（双通道全部保留）
+    def _dropped(it):
+        if len(it.get("_channels", [])) > 1:
+            return False  # 双通道永不丢弃
+        orig = float(it.get("_orig_score", 0))
+        new = float(it.get("sort_key", 0))
+        if orig <= 0:
+            return True
+        ratio = new / orig
+        return ratio < 0.5  # 减分 ≥ 50% → 丢弃
+
+    fused = [it for it in fused if not _dropped(it)]
     fused.sort(key=lambda x: -float(x.get("sort_key", 0)))
     return fused
-
 _l0_index_lock = threading.Lock()
 
 
@@ -955,8 +1019,9 @@ def recall_4layer(query, top_k=5, layers=None):
     if "L1" in layers and BM25_AVAILABLE and _bm25_search is not None:
         try:
             bm25_raw = _bm25_search(query, top_k=BM25_TOP_K)
+            # BM25 norm_score = raw/max_score，第一名 = 1.0，其他较低
+            # 用 SIM_WATERMARK (0.62) 阈值过滤：只有真正强命中才算 BM25 通道
             for r in bm25_raw:
-                # BM25 的 norm_score 是 0~1，0.62 阈值过滤
                 if r.get("norm_score", 0) < SIM_WATERMARK:
                     continue
                 pl = r.get("payload") or {}
@@ -1094,40 +1159,31 @@ def recall_4layer(query, top_k=5, layers=None):
     # 保留功能： Neo4j 还能给直接命中项加分（上面 Step 3 PRF + Step 4 entity overlap 重排）
     # 所以下面这段不再把 assoc_candidates 接入 merged_atom
 
-    # ── Step 3.5: 知识图谱直接召回的候选项入池 ───────────────────
-    # 1. 把 graph_items 转换为统一格式，接入 merged_atom
-    # 2. 调用 fusion_boost_graph_hits 对接 graph_entity_names 的项加分
-    # 3. 调用 fusion_post_fuse 做最终融合（去重+评分）
-    graph_items_normalized = []
-    for g in graph_items or []:
-        # graph_item 的 summary / entities / graph_sim 都可复用
-        g_norm = dict(g)
-        g_norm.setdefault("source", "graph")
-        g_norm.setdefault("recall_reason", "图谱直接召回")
-        # fusion_boost_graph_hits 靠 _channels 判断 graph hit，这里必须补上
-        g_norm["_channels"] = ["graph"]
-        # graph 召回顾量赋值 sort_key 供 fusion_post_fuse / fusion_boost 用
-        if "sort_key" not in g_norm:
-            g_norm["sort_key"] = float(g_norm.get("graph_sim", 0.7))
-        g_norm["graph_sim"] = g.get("graph_sim", 0)
-        graph_items_normalized.append(g_norm)
+    # ── Step 3.5: 知识图谱只用作软过滤信号，不当独立召回通道 ───────────────────
+    # 🔧 2026-09-16 重构：KG 节点（Neo4j 1-hop 扩散出来的三元组）不进 merged_atom
+    # 原因：KG 扩散出来的节点是结构化三元组（如"外婆-白云山云台"），跟用户语义意图
+    #       可能完全无关（用户问香港，结果回来外婆-白云山），污染最终召回
+    # 保留的 KG 能力：
+    #   1) graph_entity_names 已在前面提取，用作 vec/bm25 召回项的软过滤加权
+    #   2) fusion_boost_graph_hits 仍调用：给"vec/bm25 召回到的且匹配到 graph 实体"的真实记忆加分
+    #      （不是给 graph 节点本身加分）
+    #   3) fusion_post_fuse 仍调用：对真实召回项做 importance + time_decay
 
-    if graph_items_normalized:
-        # 给合并后的池子加 graph 加分
+    if graph_entity_names:
         try:
             merged_atom = fusion_boost_graph_hits(
-                merged_atom + graph_items_normalized,
+                merged_atom,
                 graph_entity_names=graph_entity_names,
                 boost=1.3,
             )
         except Exception as e:
             print(f"[warn] fusion_boost_graph_hits failed: {e}", file=sys.stderr)
 
-        # 最终融合（去重 + entity_overlap 加权 + 综合打分）
-        try:
-            merged_atom = fusion_post_fuse(merged_atom)
-        except Exception as e:
-            print(f"[warn] fusion_post_fuse failed: {e}", file=sys.stderr)
+    # 最终融合（去重 + entity_overlap 加权 + importance + time_decay）
+    try:
+        merged_atom = fusion_post_fuse(merged_atom)
+    except Exception as e:
+        print(f"[warn] fusion_post_fuse failed: {e}", file=sys.stderr)
 
     # ── 统一 Reranker（一次调用，精排全部候选）──────────────────────
     # retrieval_top_k: 合并后进入 Reranker 的候选数量
@@ -1145,17 +1201,20 @@ def recall_4layer(query, top_k=5, layers=None):
         for i, m in enumerate(merged_atom):
             rr = rerank_map.get(i, 0.0)
             m["rerank_score"] = rr
-            # A 方案：final_score 只由 rerank_score + importance 决定
-            # entity_overlap 不进打分（上层 entities 不再影响 L1 排序）
-            # importance 作为轻微加权（重要记忆优先）
+            # 融合层 sort_key 占主导（85%），reranker 只做微调（15%）
+            # reranker 可以调整顺序，但不能覆盖融合层的减权结果
             importance = float(m.get("importance", 0.5))
+            sort_key = float(m.get("sort_key", 0))
+            # 先把 reranker 分数归一化到 sort_key 同量级，再加权融合
+            # sort_key 典型范围 0.5~2.0，reranker 典型范围 0.8~1.0
+            rr_normalized = rr * (sort_key / 0.9) if sort_key > 0 else rr
             m["final_score"] = round(
-                rr * 0.9 + importance * 0.1,
+                sort_key * 0.85 + rr_normalized * 0.15,
                 4,
             )
 
     merged_atom.sort(key=lambda x: -x.get("final_score", x.get("score", 0)))
-    merged_atom = [m for m in merged_atom if (m.get("rerank_score") or 0) >= 0.95]
+    merged_atom = [m for m in merged_atom if m.get("sort_key", 0) >= 0.45]
     merged_atom = merged_atom[:top_k]
 
     all_memories = [_format_memory_with_time(m) for m in merged_atom if m.get("summary")]
