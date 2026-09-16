@@ -562,43 +562,6 @@ def neo4j_entity_search(query_text, limit=8):
                     continue
                 seen.add(key)
                 names.append(name)
-    except Exception as e:
-        # 索引可能没建（全新部署场景），降级到原 jieba + CONTAINS 方案
-        print(f"[warn] fulltext query failed, fallback to jieba scan: {e}", file=sys.stderr)
-        return _neo4j_entity_search_fallback(query_text, limit=limit)
-    finally:
-        driver.close()
-    return names
-
-
-def _neo4j_entity_search_fallback(query_text, limit=8):
-    """降级方案：索引未建时用 jieba + CONTAINS 硬匹配（仅作为兜底）。"""
-    from neo4j import GraphDatabase
-    driver = GraphDatabase.driver(
-        NEO4J_URI,
-        auth=(NEO4J_USER, NEO4J_PASSWORD),
-        notifications_min_severity="OFF",
-    )
-    seen = set()
-    names = []
-    try:
-        with driver.session() as session:
-            tokens = _tokenize_for_kg(query_text)
-            if not tokens:
-                tokens = [query_text]
-            cypher = """
-            MATCH (n)
-            WHERE n.name IS NOT NULL AND any(t in $tokens WHERE toLower(n.name) CONTAINS toLower(t))
-            RETURN n.name AS name, labels(n) AS labels
-            LIMIT $limit
-            """
-            for rec in session.run(cypher, tokens=tokens, limit=limit).data():
-                name = rec["name"]
-                key = name.lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                names.append(name)
     finally:
         driver.close()
     return names

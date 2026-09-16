@@ -776,6 +776,264 @@ def association_expand(query, seed_entities, seed_summaries, config, embed_fn=No
 # 自检
 # ============================================================
 
+
+
+# ============================================================
+# 融合算法插件（动态切换 / 环境变量）
+# ============================================================
+# 切换方式（仅环境变量，避免多次切换干扰）：
+#   export MEMORY_OS_FUSION_ALGORITHM=arithmetic   # 默认（日常聊天）
+#   export MEMORY_OS_FUSION_ALGORITHM=rrf          # 企业级全量召回
+#
+# 独立性约束：两个算法实例各自独立，无任何状态共享。
+
+import os
+import threading as _threading
+from abc import ABC, abstractmethod
+
+
+class FusionAlgorithm(ABC):
+    """融合算法抽象基类。"""
+
+    name: str = "base"
+
+    @abstractmethod
+    def fuse(
+        self,
+        vec_items: list,
+        bm25_items: list,
+        graph_entity_names=None,
+    ) -> list:
+        raise NotImplementedError
+
+
+class ArithmeticFusion(FusionAlgorithm):
+    """算术融合（默认 / 日常聊天）：精确召回，减分≥50%丢弃。"""
+
+    name = "arithmetic"
+
+    BM25_HIT_THRESHOLD = 0.62
+    SINGLE_PENALTY = 0.3
+    DUAL_BOOST_MULT = 1.8
+    NEO4J_BOOST_CAP = 0.3
+    SINGLE_DROP_THRESHOLD = 0.5
+
+    def fuse(self, vec_items, bm25_items, graph_entity_names=None):
+        by_key = {}
+
+        for it in vec_items or []:
+            key = (it.get("summary") or "")[:60].strip()
+            if not key or key in by_key:
+                continue
+            it["_orig_score"] = float(it.get("score", 0))
+            it["sort_key"] = it["_orig_score"]
+            it["_channels"] = ["vec"]
+            by_key[key] = it
+
+        bm25_hit_keys = set()
+        for it in bm25_items or []:
+            key = (it.get("summary") or "")[:60].strip()
+            if key:
+                bm25_hit_keys.add(key)
+
+        for it in bm25_items or []:
+            key = (it.get("summary") or "")[:60].strip()
+            if not key:
+                continue
+            bm25_norm = float(it.get("norm_score", 0))
+            if key in by_key:
+                if bm25_norm >= self.BM25_HIT_THRESHOLD:
+                    vec_score = by_key[key]["_orig_score"]
+                    geo = (vec_score * bm25_norm) ** 0.5
+                    by_key[key]["sort_key"] = round(geo * self.DUAL_BOOST_MULT, 4)
+                    by_key[key]["_channels"] = ["vec", "bm25"]
+                else:
+                    by_key[key]["sort_key"] = round(
+                        by_key[key]["_orig_score"] * self.SINGLE_PENALTY, 4
+                    )
+                    by_key[key]["_channels"] = ["vec"]
+            else:
+                if bm25_norm >= self.BM25_HIT_THRESHOLD:
+                    it["_orig_score"] = bm25_norm
+                    it["sort_key"] = round(bm25_norm * self.SINGLE_PENALTY, 4)
+                    it["_channels"] = ["bm25"]
+                    by_key[key] = it
+
+        fused = list(by_key.values())
+
+        if graph_entity_names:
+            ent_set = {e.strip().lower() for e in graph_entity_names if e}
+            for it in fused:
+                channels = it.get("_channels", [])
+                if len(channels) > 1:
+                    continue
+                summary_lower = (it.get("summary") or "").lower()
+                item_ents = {
+                    e.strip().lower()
+                    for e in (it.get("entities") or [])
+                    if e
+                }
+                hit = any(e in summary_lower for e in ent_set) or bool(ent_set & item_ents)
+                if hit:
+                    it["sort_key"] = round(it["sort_key"] + self.NEO4J_BOOST_CAP, 4)
+
+        for it in fused:
+            if (
+                len(it.get("_channels", [])) == 1
+                and it.get("_channels", [""])[0] == "vec"
+            ):
+                key = (it.get("summary") or "")[:60].strip()
+                if key not in bm25_hit_keys:
+                    it["sort_key"] = round(it["_orig_score"] * self.SINGLE_PENALTY, 4)
+
+        fused = [it for it in fused if not self._is_dropped(it)]
+
+        # 末尾后处理（arithmetic 有）：importance 加权 + 时间衰减
+        fused = importance_weight(fused)
+        fused = time_decay(fused)
+
+        fused.sort(key=lambda x: -float(x.get("sort_key", 0)))
+        return fused
+
+    def _is_dropped(self, it):
+        if len(it.get("_channels", [])) > 1:
+            return False
+        orig = float(it.get("_orig_score", 0))
+        new = float(it.get("sort_key", 0))
+        if orig <= 0:
+            return True
+        return (new / orig) < self.SINGLE_DROP_THRESHOLD
+
+
+class RRFFusion(FusionAlgorithm):
+    """RRF 融合（企业级）：按排名累加，不丢弃，全量召回。"""
+
+    name = "rrf"
+
+    RRF_K = 60
+    # 缩放因子：RRF 原始分约 0.01~0.03，乘 100 后变 1~3，跟 arithmetic 同一量纲
+    # 这样 fusion_post_fuse 里的 importance 加权和 final_score 公式才能兼容
+    RRF_SCALE = 100.0
+    NEO4J_CHANNEL_WEIGHT = 50.0  # 对应 arithmetic 的 +0.3 / 60 * 100 = 50
+
+    def fuse(self, vec_items, bm25_items, graph_entity_names=None):
+        vec_ranks = self._build_rank_map(vec_items or [])
+        bm25_ranks = self._build_rank_map(bm25_items or [])
+
+        all_keys = set(vec_ranks.keys()) | set(bm25_ranks.keys())
+        fused = []
+
+        for key in all_keys:
+            rrf = 0.0
+            channels = []
+            vec_rank = vec_ranks.get(key)
+            bm25_rank = bm25_ranks.get(key)
+
+            if vec_rank is not None:
+                rrf += 1.0 / (self.RRF_K + vec_rank)
+                channels.append("vec")
+            if bm25_rank is not None:
+                rrf += 1.0 / (self.RRF_K + bm25_rank)
+                channels.append("bm25")
+
+            source = None
+            if vec_rank is not None:
+                source = self._get_item_by_key(vec_items or [], key)
+            if source is None:
+                source = self._get_item_by_key(bm25_items or [], key)
+
+            item = dict(source) if source else {}
+            item["_channels"] = channels
+            item["_orig_score"] = float(source.get("score", 0)) if source else 0.0
+            item["sort_key"] = round(rrf * self.RRF_SCALE, 6)
+            item["rrf_score"] = round(rrf, 6)  # 保留原始 RRF 分供调试
+            fused.append(item)
+
+        if graph_entity_names:
+            ent_set = {e.strip().lower() for e in graph_entity_names if e}
+            for it in fused:
+                summary_lower = (it.get("summary") or "").lower()
+                item_ents = {
+                    e.strip().lower()
+                    for e in (it.get("entities") or [])
+                    if e
+                }
+                hit = any(e in summary_lower for e in ent_set) or bool(ent_set & item_ents)
+                if hit:
+                    it["sort_key"] = round(it["sort_key"] + self.NEO4J_CHANNEL_WEIGHT, 6)
+
+        # 末尾后处理（RRF 只跑时间衰减，不跑 importance_weight）：
+        # RRF 本意是按召回排名排序，与记忆重要性无关，不应被 importance 二次加权
+        fused = time_decay(fused)
+
+        fused.sort(key=lambda x: -float(x.get("sort_key", 0)))
+        return fused
+
+    def _build_rank_map(self, items):
+        rank_map = {}
+        for rank, it in enumerate(items, start=1):
+            key = (it.get("summary") or "")[:60].strip()
+            if key and key not in rank_map:
+                rank_map[key] = rank
+        return rank_map
+
+    def _get_item_by_key(self, items, key):
+        for it in items:
+            if (it.get("summary") or "")[:60].strip() == key:
+                return it
+        return None
+
+
+# 注册表（线程安全，全局单例）
+_FUSION_REGISTRY = {
+    "arithmetic": ArithmeticFusion(),
+    "rrf": RRFFusion(),
+}
+_FUSION_LOCK = _threading.Lock()
+_FUSION_ACTIVE = None  # 初始为空，第一次 get_fusion() 时按 env 变量初始化
+
+
+def _read_env_fusion() -> str:
+    name = os.environ.get("MEMORY_OS_FUSION_ALGORITHM", "arithmetic").lower().strip()
+    return name if name in _FUSION_REGISTRY else "arithmetic"
+
+
+def get_fusion() -> FusionAlgorithm:
+    """获取当前激活的融合算法实例。"""
+    global _FUSION_ACTIVE
+    with _FUSION_LOCK:
+        if _FUSION_ACTIVE is None:
+            _FUSION_ACTIVE = _FUSION_REGISTRY[_read_env_fusion()]
+        return _FUSION_ACTIVE
+
+
+def set_fusion(name: str) -> FusionAlgorithm:
+    """显式切换融合算法。"""
+    global _FUSION_ACTIVE
+    name = name.lower().strip()
+    if name not in _FUSION_REGISTRY:
+        raise ValueError(
+            f"unknown fusion algorithm: {name} "
+            f"(available: {list(_FUSION_REGISTRY.keys())})"
+        )
+    with _FUSION_LOCK:
+        _FUSION_ACTIVE = _FUSION_REGISTRY[name]
+        return _FUSION_ACTIVE
+
+
+def reset_to_env_default() -> FusionAlgorithm:
+    """重置回环境变量指定的算法。"""
+    global _FUSION_ACTIVE
+    with _FUSION_LOCK:
+        _FUSION_ACTIVE = _FUSION_REGISTRY[_read_env_fusion()]
+        return _FUSION_ACTIVE
+
+
+def list_algorithms():
+    """列出所有可用算法名。"""
+    return list(_FUSION_REGISTRY.keys())
+
+
 if __name__ == "__main__":
     # 模拟一些数据
     graph_items = [

@@ -190,8 +190,13 @@ async function ensureServicesRunning() {
       cmd  = "brew";
       args = ["services", "start", "neo4j"];
     } else if (name === "qdrant") {
-      cmd  = "brew";
-      args = ["services", "start", "qdrant"];
+      cmd  = "launchctl";
+      args = ["kickstart", "gui/501/com.openclaw.qdrant"];
+      fallback = {
+        cmd: "/Users/king/.local/bin/qdrant",
+        args: ["--config-path", "/Users/king/.openclaw/workspace/memory-os/config/qdrant.yaml"],
+        cwd: "/Users/king/.openclaw/workspace/memory-os",
+      };
     } else if (name === "embed") {
       cmd  = "launchctl";
       args = ["kickstart", `gui/501/com.memoryos.embed-daemon`];
@@ -1429,6 +1434,70 @@ export default definePluginEntry({
         } catch {}
 
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      },
+    });
+
+    // ── 工具：memory_os_fusion（动态切换融合算法）─────────────
+    // 设计：插件型融合算法，可运行时切换 / 查询当前算法。
+    // 使用场景：
+    //   - 日常聊天（默认）：arithmetic = 减分≥50%丢弃的精确召回
+    //   - 企业级全量召回：rrf = RRF 排名累加，不丢弃
+    // 调用方式：
+    //   - list  → 列出可用算法 + 当前激活
+    //   - current → 仅查当前激活
+    //   - switch <arithmetic|rrf> → 运行时切换（进程重启失效）
+    //   - reset  → 重置回环境变量 MEMORY_OS_FUSION_ALGORITHM 指定的算法
+    // 注意：运行时切换是当前进程级，OpenClaw 重启后丢；如需持久化请设环境变量。
+    api.registerTool({
+      name: "memory_os_fusion",
+      description: "动态切换 / 查询 Memory OS 召回融合算法。\n\n【可用算法】\n- arithmetic（默认）：算术融合 + 减分≥50%丢弃，适合日常聊天精确召回\n- rrf：RRF 排名累加，不丢弃，适合企业级全量召回场景\n\n【用法】\n- action='list'：列出所有可用算法 + 当前激活\n- action='current'：仅查当前激活\n- action='switch' name='rrf'：运行时切换（进程级，重启失效）\n- action='reset'：重置回环境变量 MEMORY_OS_FUSION_ALGORITHM 指定的算法",
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["list", "current", "switch", "reset"],
+            description: "操作类型：list / current / switch / reset",
+            default: "list",
+          },
+          name: {
+            type: "string",
+            enum: ["arithmetic", "rrf"],
+            description: "目标算法名（仅 action='switch' 必填）",
+          },
+        },
+        required: ["action"],
+      },
+      async execute(_id, params) {
+        const action = (params.action || "list").toLowerCase().trim();
+        const args = [action];
+        if (action === "switch") {
+          if (!params.name) {
+            return { content: [{ type: "text", text: JSON.stringify({
+              ok: false,
+              error: "missing_name",
+              message: "switch 操作必须传 name (arithmetic | rrf)",
+            }, false) }] };
+          }
+          args.push(params.name);
+        }
+        try {
+          const res = await runPython(args, {
+            env: buildEnv(config),
+            script: path.resolve(__dirname, "../scripts/fusion_cli.py"),
+            timeoutMs: 10000,
+          });
+          const payload = JSON.parse(res.stdout.trim());
+          return { content: [{ type: "text", text: JSON.stringify(payload, false) }] };
+        } catch (err) {
+          const errMsg = (err && err.message) ? err.message : String(err);
+          return { content: [{ type: "text", text: JSON.stringify({
+            ok: false,
+            error: "service_unavailable",
+            message: `fusion CLI 调用失败: ${errMsg}`,
+            suggested_next: "检查 Python venv 是否完整（需 rank-bm25），fusion_cli.py 路径是否正确",
+          }, false) }] };
+        }
       },
     });
 

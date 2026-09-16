@@ -5,7 +5,7 @@
   "description": "Neo4j + Qdrant long-term memory system + Runtime State Timer",
   "contracts": {
     "hooks": ["message_received", "agent_end", "before_prompt_build"],
-    "tools": ["memory_os_ingest", "memory_os_recall", "memory_os_update", "memory_os_delete", "memory_os_health", "memory_os_extract_runtime"]
+    "tools": ["memory_os_ingest", "memory_os_recall", "memory_os_update", "memory_os_delete", "memory_os_health", "memory_os_extract_runtime", "memory_os_fusion"]
   },
   "activation": {
     "onStartup": true
@@ -17,7 +17,7 @@
       "neo4jUser": { "type": "string", "default": "neo4j" },
       "neo4jPassword": { "type": "string" },
       "qdrantHost": { "type": "string", "default": "127.0.0.1" },
-      "qdrantPort": { "type": "integer", "default": 6333 },
+      "qdrantPort": { "type": "integer", "default": 6334 },
       "embeddingModel": { "type": "string", "default": "${HOME}/.openclaw/workspace/models/bge-m3-Q8_0.gguf" },
       "cronSchedule": { "type": "string", "default": "30 3 * * *" },
       "dedupThreshold": { "type": "number", "default": 0.95 },
