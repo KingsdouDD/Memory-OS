@@ -130,7 +130,7 @@ def write_l0_conversation(l0_payload, l1_kos=None, linked_l1_pids=None):
     if not scene_summary:
         return {"layer": "L0", "skipped": True, "reason": "缺少 scene_summary"}
 
-    # ---- 0. L0 去重决策（2026-09-12 老豆决定：只对比 L0，LLM 纯字面对比）----
+    # ---- 0. L0 去重决策（2026-09-12 确认：只对比 L0，LLM 纯字面对比）----
     candidates = _ann_find_candidates_in_collection(L0_COLLECTION, scene_summary, top_k=5)
     action, reason = _rule_decide_layer_action(l0_payload.get("state"), candidates, layer="L0", new_text=scene_summary)
     if action == "SKIP":
@@ -287,7 +287,7 @@ def write_l2_scenario(scenario, linked_l1_pids=None):
     entities = scenario.get("entities") or []
     scenario_id = title or summary[:50]
 
-    # ---- 0. L2 不做去重（2026-09-12 老豆决定：只有 L0 做去重对比）----
+    # ---- 0. L2 不做去重（2026-09-12 确认：只有 L0 做去重对比）----
     # ---- 1. Neo4j: Scenario 节点 + 实体关联 ----
 
     # ---- 1. Neo4j: Scenario 节点 + 实体关联 ----
@@ -417,7 +417,7 @@ def write_l3_personas(personas, linked_l1_pids=None):
         p = _normalize_time_fields(p, source_path=None)
         p["layer"] = "L3"
 
-        # ---- L3 不做去重（2026-09-12 老豆决定：只有 L0 做去重对比）----
+        # ---- L3 不做去重（2026-09-12 确认：只有 L0 做去重对比）----
 
         # ---- 1. Neo4j Persona 节点 ----
         neo4j_ok = False

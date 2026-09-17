@@ -160,7 +160,7 @@ def log_config_dump_once():
 # ============================================================
 
 _VAGUE_PATTERNS = [
-    # "充满了" 只杀纯抽象总结（充满了快乐/幸福），"充满了...钓龙虾摸鱼" 是具体活动要留
+    # "充满了" 只杀纯抽象总结（充满了快乐/幸福），"充满了...摸鱼抓虾" 是具体活动要留
     r"充满了(快乐|幸福|回忆|欢乐|爱|童年|阳光)",
     r"主要是|基本上是|总的来说|一般般|还不错",
     r"的性格|的特点|的为人|很认真|很善良|很正能量|很好|很棒",
@@ -1560,7 +1560,7 @@ def _ann_find_candidates(client, collection, ko, top_k=None):
 
 
 def _rule_decide_action(ko, candidates):
-    """决策入口（2026-09-12 老豆决定）：统一走 LLM 语义去重，不做 ANN 合并。
+    """决策入口（2026-09-12 确认）：统一走 LLM 语义去重，不做 ANN 合并。
     委托给 dedup_bridge.dedup_decide_layer_action，不再返回 UPDATE/OVERRIDE。
     """
     from dedup_bridge import dedup_decide_layer_action
@@ -1907,7 +1907,7 @@ def write_kos_v5_return_pids(kos):
                 except Exception as e:
                     print(f"[warn] ensure collection {collection}: {e}", file=sys.stderr)
 
-            # L1 不做去重（2026-09-12 老豆决定：只对比 L0）
+            # L1 不做去重（2026-09-12 确认：只对比 L0）
             # 直接 CREATE，每条 KO 独立一条 L1
             # 不写 decision 日志（避免噪声）
 

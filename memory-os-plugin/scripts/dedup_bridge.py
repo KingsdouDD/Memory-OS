@@ -3,7 +3,7 @@ dedup_bridge.py
 ================
 写入层去重决策桥接器（位于 scripts/ 目录，供 write_4layer.py 调用）。
 
-当前实现（2026-09-12 老豆最终决定）：
+当前实现（2026-09-12 确认）：
   - 只有 L0 做去重：LLM 纯字面对比（不是向量 ANN，不是语义判断）
   - L1/L2/L3：不做任何对比，直接 CREATE
   - LLM 判断：两段文字是否字面上说的是同一件事（字面相同则 SKIP）
@@ -102,7 +102,7 @@ def _llm_judge_text_same(new_text, cand_text):
 
 def dedup_decide_layer_action(state, candidates, layer=None, new_text=None, qdrant_client=None):
     """
-    去重决策（2026-09-12 老豆最终决定）。
+    去重决策（2026-09-12 确认）。
 
     核心原则：
       - 只对比 L0

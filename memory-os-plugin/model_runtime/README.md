@@ -57,8 +57,8 @@ LLM 驱动的记忆去重决策（替代原 `_rule_decide_layer_action`）。
 from model_runtime import llm_decide_action
 
 action, reason = llm_decide_action(
-    new_text="外婆半夜帮我盘猪老二",
-    candidates=[{"pid": "...", "score": 0.891, "summary": "外婆与老豆关系亲密", "state": "active"}],
+    new_text="用户和朋友深夜活动后回家",
+    candidates=[{"pid": "...", "score": 0.891, "summary": "用户与朋友关系亲近", "state": "active"}],
     new_state="historical",
     layer="L3",
 )
