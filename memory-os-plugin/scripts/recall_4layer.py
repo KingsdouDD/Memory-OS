@@ -49,8 +49,11 @@ except Exception:
     BM25_AVAILABLE = False
 
 # ── 召回阈值（2026-09-11 与老豆确认）────────────────────────────
-VEC_TOP_K = 10           # 向量召回 top-10
-BM25_TOP_K = 10          # BM25 召回 top-10
+# 🔧 2026-09-17 调整：数据量增大后召回策略改为多轮渐进式过滤
+VEC_TOP_K = 20           # 向量召回 top-20
+BM25_TOP_K = 20          # BM25 召回 top-20
+FUSED_TOP_K = 15         # 融合后取 top-15 进 reranker
+RERANK_TOP_K = 5         # reranker 输出 top-5（作为最终输出）
 SIM_WATERMARK = 0.62     # 向量 / BM25 双方 sim 阈值（确值）
 DUAL_CHANNEL_BOOST = 1.5  # vec ∩ bm25 双通道命中加权
 SINGLE_CHANNEL_PENALTY = 0.7  # 单通道命中减权
@@ -1087,11 +1090,15 @@ def recall_4layer(query, top_k=5, layers=None):
     # RRFFusion.fuse() 末尾已调 time_decay（跳过 importance_weight，保持 RRF 纯粹性）
     # 这里不再调 fusion_post_fuse，避免重复加权
 
-    # ── 统一 Reranker（一次调用，精排全部候选）──────────────────────
-    # retrieval_top_k: 合并后进入 Reranker 的候选数量
+    # ── 统一 Reranker（一次调用，reranker 接管最终顺序）──────────────
+    # 🔧 2026-09-17 调整：reranker 输入仅取融合后 top-15，输出 top-5 作为最终
+    # 进度：vec top-20 → bm25 top-20 → fused top-15 → rerank top-5
+    # final_score 改用 reranker 原始分（100% 重排模型决定），不再与 sort_key 混合
+    merged_atom.sort(key=lambda x: -float(x.get("sort_key", 0)))
+    merged_atom = merged_atom[:FUSED_TOP_K]
     retrieval_top_k = len(merged_atom)
-    reranker_input_k = retrieval_top_k  # 输入数量（input k = output k）
-    reranker_output_k = retrieval_top_k
+    reranker_input_k = retrieval_top_k
+    reranker_output_k = RERANK_TOP_K  # 固定输出 top-5
 
     reranker_call_count = 0
     if merged_atom:
@@ -1100,24 +1107,25 @@ def recall_4layer(query, top_k=5, layers=None):
         reranker_call_count = 1
         rerank_map = {idx: score for idx, score in reranked}
 
-        for i, m in enumerate(merged_atom):
-            rr = rerank_map.get(i, 0.0)
-            m["rerank_score"] = rr
-            # 融合层 sort_key 占主导（85%），reranker 只做微调（15%）
-            # reranker 可以调整顺序，但不能覆盖融合层的减权结果
-            importance = float(m.get("importance", 0.5))
-            sort_key = float(m.get("sort_key", 0))
-            # 先把 reranker 分数归一化到 sort_key 同量级，再加权融合
-            # sort_key 典型范围 0.5~2.0，reranker 典型范围 0.8~1.0
-            rr_normalized = rr * (sort_key / 0.9) if sort_key > 0 else rr
-            m["final_score"] = round(
-                sort_key * 0.85 + rr_normalized * 0.15,
-                4,
-            )
+        # 按 reranker 返回顺序重建 merged_atom（reranker 100% 决定顺序）
+        reranked_atom = []
+        for idx, _ in reranked:
+            if 0 <= idx < len(merged_atom):
+                m = merged_atom[idx]
+                m["rerank_score"] = rerank_map[idx]
+                # 100% 用 reranker 分数，sort_key 只保留为调试参考
+                m["final_score"] = round(rerank_map[idx], 4)
+                reranked_atom.append(m)
+        # reranker 漏召的候选（idx >= len(reranked)）默认按 sort_key 补位
+        for idx in range(len(merged_atom)):
+            if idx not in rerank_map:
+                m = merged_atom[idx]
+                m["rerank_score"] = 0.0
+                m["final_score"] = round(m.get("score", 0) or 0.0001, 4)
+                reranked_atom.append(m)
+        merged_atom = reranked_atom
 
-    merged_atom.sort(key=lambda x: -x.get("final_score", x.get("score", 0)))
-    merged_atom = [m for m in merged_atom if m.get("sort_key", 0) >= 0.45]
-    merged_atom = merged_atom[:top_k]
+    merged_atom = merged_atom[:RERANK_TOP_K]
 
     all_memories = [_format_memory_with_time(m) for m in merged_atom if m.get("summary")]
     overlap_avg = (
