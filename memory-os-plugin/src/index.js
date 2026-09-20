@@ -656,6 +656,7 @@ function buildEnv(cfg) {
   if (cfg.qdrantPort) env.MEMORY_OS_QDRANT_PORT = String(cfg.qdrantPort);
   if (cfg.embeddingModel) env.MEMORY_OS_EMBEDDING_MODEL = cfg.embeddingModel;
   if (cfg.dedupThreshold !== undefined) env.MEMORY_OS_DEDUP_THRESHOLD = String(cfg.dedupThreshold);
+  if (cfg.fusionAlgorithm) env.MEMORY_OS_FUSION_ALGORITHM = cfg.fusionAlgorithm;
   return env;
 }
 

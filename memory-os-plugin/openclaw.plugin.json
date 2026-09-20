@@ -22,6 +22,7 @@
       "cronSchedule": { "type": "string", "default": "30 3 * * *" },
       "dedupThreshold": { "type": "number", "default": 0.95 },
       "hookTraceEnabled": { "type": "boolean", "default": true, "description": "开关钩子日志（hook-trace.md），默认开；设为 false 关闭写入，排查问题时再开" },
+      "fusionAlgorithm": { "type": "string", "default": "arithmetic", "description": "召回融合算法：arithmetic（默认，算术融合）或 rrf（排名融合）" },
       "runtimeStateTimer": {
         "type": "object",
         "properties": {

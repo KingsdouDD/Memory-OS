@@ -12,14 +12,20 @@ neo4j/**/*~
 qdrant/storage/
 qdrant/*.db
 qdrant/**/*.db
+qdrant/data/
+qdrant/logs/
+data/
 
 # Models — downloaded at runtime, large binary files
+models/
 models/**/*.bin
 models/**/*.safetensors
 models/**/*.gguf
 models/**/*.pt
 models/**/*.pth
 models/**/model.safetensors*
+models/**/*.bpe.model
+models/**/*.json
 
 # Tokens / secrets
 tokens/*.json
@@ -29,13 +35,27 @@ tokens/*.env
 tokens/*.txt
 tokens/*.key
 
-# Logs
+# Logs — including .md hooks/decisions traces
+logs/
 logs/*.log
 logs/**/*.log
+logs/*.md
+logs/**/*.md
+
+# Runtime State Timer — 临时状态（个人对话上下文）
+memory-os-plugin/runtime_active_state/
+memory-os-plugin/runtime_active_state/*
+
+# Snapshots — 备份快照可能含用户数据
+snapshots/
 
 # Python venv
 venv/
 .venv/
+
+# Test artifacts — 临时测试文件
+/tmp/mcp_client_test.py
+/tmp/mcp_e2e_test.py
 
 # DS_Store
 .DS_Store
