@@ -552,6 +552,7 @@ def write_4layer(payload):
     l1_report = {}
 
     # 0) L0 判重（不写，只判。SKIP 则整条不写）
+    # 原则：L0 重复 → 整条记忆跳过（L1/L2/L3 不再单独写入，避免重复）
     if l0 and l0.get("scene_summary"):
         scene_summary = (l0.get("scene_summary") or "").strip()
         candidates = _ann_find_candidates_in_collection(L0_COLLECTION, scene_summary, top_k=5)

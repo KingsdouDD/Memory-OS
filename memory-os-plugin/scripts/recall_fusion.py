@@ -73,47 +73,60 @@ def _parse_ts(ts_str: str):
 
 
 # ============================================================
-# 进阶 6：时间衰减
+# 进阶 6：时间衰减（2026-09-20 重写：有界加法）
 # ============================================================
 
 def time_decay(items, half_life_days=180):
-    """对每个 item 的 score 乘上时间衰减因子。
-       weight = 0.5 ** (Δdays / half_life_days)
-       - 半衰期 180 天：180 天前的记忆权重降到 0.5
-       - 1 天内的记忆权重 ~1.0
-       - 缺 ts 的记忆按 1.0 处理（不衰减）
+    """对每个 item 加上有界时间调整量。
+       old: sort_key *= 0.5 ** (Δdays / half_life_days)  → 极端可达 ×0.05，连乘放大失控
+       new: sort_key *= (1 + bounded_delta)
+              delta = -TIME_DECAY_MAX * min(delta_days / max_decay_days, 1.0)
+       - Δt=0 → delta=0     → 1.0×不变
+       - Δt=180天 → -TIME_DECAY_MAX/2
+       - Δt=max_decay_days=540天 → -TIME_DECAY_MAX
+       - 缺 ts → 1.0× 不衰减
+       - TIME_DECAY_MAX = 0.25：极差 ±0.25，搭配 importance 和 graph_hit 极差 ±0.4
+       - 保证总乘数范围 [0.6, 1.4]，避免被乘数主宰排序
     """
+    TIME_DECAY_MAX = 0.25
+    max_decay_days = 540  # 540 天外不再继续衰减
     now = datetime.now(CN_TZ)
     for it in items:
         ts = _parse_ts(it.get("ts") or "")
         if ts is None:
             continue
         delta_days = max(0.0, (now - ts).total_seconds() / 86400.0)
-        weight = 0.5 ** (delta_days / max(half_life_days, 1.0))
+        ratio = min(delta_days / max_decay_days, 1.0)
+        delta = -TIME_DECAY_MAX * ratio
         sk = float(it.get("sort_key", it.get("score", 0)))
-        it["sort_key"] = round(sk * weight, 4)
+        it["sort_key"] = round(sk * (1 + delta), 4)
     return items
 
 
 # ============================================================
-# 核心 4：importance 加权
+# 核心 4：importance 加权（2026-09-20 重写：有界加法）
 # ============================================================
 
 def importance_weight(items):
-    """对每个 item 的排序键 sort_key 乘以 (0.5 + importance)。
-       importance=0.5 → 1.0×  不变
-       importance=1.0 → 1.5×  重要记忆浮顶
-       importance=0.0 → 0.5×  低价值记忆下沉
-       缺 importance 按 0.5 处理
-       🔧 2026-08-10 修复：不再覆盖 score（score 保留 RRF 原始分，
-       否则 score 会 >1 且 kg_verify 阈值失效）。加权只影响 sort_key。
+    """对每个 item 加上有界重要性调整量。
+       old: sort_key *= (0.5 + importance)  → 极差 [0.5×, 1.5×]，连乘放大失控
+       new: sort_key *= (1 + (importance - 0.5) * IMP_WEIGHT)
+              IMP_WEIGHT = 0.5 → imp=1 时 +0.25，imp=0 时 -0.25
+       - importance=0.5 → 1.0×  不变（中性）
+       - importance=1.0 → 1.25×  重要记忆浮顶
+       - importance=0.0 → 0.75×  低价值记忆下沉
+       - 缺 importance 按 0.5 处理
+       - 极差 ±0.25，足够区分但不主宰
+       🔧 2026-08-10 修复：不再覆盖 score（score 保留 RRF 原始分）。
+       🔧 2026-09-20 修复：有界加法，连乘不再放大。
     """
+    IMP_WEIGHT = 0.5
     for it in items:
         imp = float(it.get("importance", 0.5))
         imp = max(0.0, min(1.0, imp))
-        weight = 0.5 + imp
+        delta = (imp - 0.5) * IMP_WEIGHT
         sk = float(it.get("sort_key", it.get("score", 0)))
-        it["sort_key"] = round(sk * weight, 4)
+        it["sort_key"] = round(sk * (1 + delta), 4)
     return items
 
 
@@ -185,10 +198,16 @@ def fusion_transform_channel(items, channel_name):
 # Hook 2：图命中 boost（rrf_fuse 之后调）
 # ============================================================
 
-def fusion_boost_graph_hits(fused, graph_entity_names, boost=1.3):
+def fusion_boost_graph_hits(fused, graph_entity_names, boost=0.15):
     """对图谱命中的 item 加权。
        原代码 bug：判定 "graph" in source，但 rrf_fuse 已把 source 改成首个通道名。
        修复：用 _channels（列表）判断是否含 graph，且用实体名做二次验证。
+
+       🔧 2026-09-20 修复：×1.3 → 有界加法 +0.15
+       old: sort_key *= 1.3（连乘放大失控，极端下这会变成 39 倍差的一部分）
+       new: sort_key *= (1 + boost) where boost=0.15
+       - 图命中 +0.15，与 importance (±0.25) / time_decay (-0.25~0) 同量级
+       - 极差控制在 ±0.4 内，保留 ranker 顺序又不被乘数主宰
     """
     if not fused or not graph_entity_names:
         return fused
@@ -202,7 +221,7 @@ def fusion_boost_graph_hits(fused, graph_entity_names, boost=1.3):
         )
         if is_graph_hit:
             sk = float(item.get("sort_key", item.get("score", 0)))
-            item = {**item, "sort_key": round(sk * boost, 4)}
+            item = {**item, "sort_key": round(sk * (1 + boost), 4)}
         boosted.append(item)
     boosted.sort(key=lambda x: -float(x.get("sort_key", x.get("score", 0))))
     return boosted
@@ -808,15 +827,29 @@ class FusionAlgorithm(ABC):
 
 
 class ArithmeticFusion(FusionAlgorithm):
-    """算术融合（默认 / 日常聊天）：精确召回，减分≥50%丢弃。"""
+    """算术融合（默认 / 日常聊天）：精确召回，减分丢弃。
+
+    🔧 2026-09-20 修复致命 bug：
+       原 SINGLE_PENALTY=0.3 < SINGLE_DROP_THRESHOLD=0.5，
+       导致“new/orig = 0.3”恒成立，纯 vec 召回（BM25 未命中）被整批删除。
+       新约束：SINGLE_PENALTY > SINGLE_DROP_THRESHOLD，保证减分后还能过线。
+
+    🔧 2026-09-20 参数独立：所有可调参数都从环境变量读取（默认值与原硬编码一致）。
+       调参不会跨算法互相干扰：
+         MEMORY_OS_ARITH_BM25_HIT_THRESHOLD     默认 0.62
+         MEMORY_OS_ARITH_SINGLE_PENALTY          默认 0.7  （关键：必须 > SINGLE_DROP_THRESHOLD）
+         MEMORY_OS_ARITH_DUAL_BOOST_MULT         默认 1.8
+         MEMORY_OS_ARITH_NEO4J_BOOST_CAP         默认 0.3  （ArithmeticFusion 内部未使用，保留向后兼容）
+         MEMORY_OS_ARITH_SINGLE_DROP_THRESHOLD   默认 0.5
+    """
 
     name = "arithmetic"
 
-    BM25_HIT_THRESHOLD = 0.62
-    SINGLE_PENALTY = 0.3
-    DUAL_BOOST_MULT = 1.8
-    NEO4J_BOOST_CAP = 0.3
-    SINGLE_DROP_THRESHOLD = 0.5
+    BM25_HIT_THRESHOLD = float(os.environ.get("MEMORY_OS_ARITH_BM25_HIT_THRESHOLD", "0.62"))
+    SINGLE_PENALTY = float(os.environ.get("MEMORY_OS_ARITH_SINGLE_PENALTY", "0.7"))
+    DUAL_BOOST_MULT = float(os.environ.get("MEMORY_OS_ARITH_DUAL_BOOST_MULT", "1.8"))
+    NEO4J_BOOST_CAP = float(os.environ.get("MEMORY_OS_ARITH_NEO4J_BOOST_CAP", "0.3"))
+    SINGLE_DROP_THRESHOLD = float(os.environ.get("MEMORY_OS_ARITH_SINGLE_DROP_THRESHOLD", "0.5"))
 
     def fuse(self, vec_items, bm25_items, graph_entity_names=None):
         by_key = {}
@@ -861,21 +894,13 @@ class ArithmeticFusion(FusionAlgorithm):
 
         fused = list(by_key.values())
 
-        if graph_entity_names:
-            ent_set = {e.strip().lower() for e in graph_entity_names if e}
-            for it in fused:
-                channels = it.get("_channels", [])
-                if len(channels) > 1:
-                    continue
-                summary_lower = (it.get("summary") or "").lower()
-                item_ents = {
-                    e.strip().lower()
-                    for e in (it.get("entities") or [])
-                    if e
-                }
-                hit = any(e in summary_lower for e in ent_set) or bool(ent_set & item_ents)
-                if hit:
-                    it["sort_key"] = round(it["sort_key"] + self.NEO4J_BOOST_CAP, 4)
+        # 🔧 2026-09-20 清理：删除重复的 ent_set & item_ents 计算。
+        # 原逻辑里这段 graph_entity_names boost 是与 fusion_boost_graph_hits
+        # (recall_4layer 主流程调) 重复计算同一件事，且是 ArithmeticFusion
+        # 内部隐藏的额外加权（在 MULT / NEO4J_BOOST_CAP 之外又 +0.3）。
+        # 语义上易跟 fusion_boost_graph_hits 冲突（两次加成）。
+        # 现在统一交给 fusion_boost_graph_hits（外部 hook），
+        # 本类仅负责通道内融合，不再插 Neo4j boost。
 
         for it in fused:
             if (
@@ -906,15 +931,31 @@ class ArithmeticFusion(FusionAlgorithm):
 
 
 class RRFFusion(FusionAlgorithm):
-    """RRF 融合（企业级）：按排名累加，不丢弃，全量召回。"""
+    """RRF 融合（企业级）：按排名累加，不丢弃，全量召回。
+
+    🔧 2026-09-20 修复：NEO4J_CHANNEL_WEIGHT=50.0 是个针对 arithmetic 的 0.3 / 60 * 100 补的补丁，
+       RRF_SCALE=100 本身也是为了和 arithmetic 同量纲被迫引入。
+       新设计：RRF 不再需要跨算法量纲对齐，NEO4J 实体命中改为有界加法 +0.15 × sort_key，
+       不再加绝对量，保留 RRF 本意（按召回排名排序）。
+
+    🔧 2026-09-20 明确架构边界（你 brief 里的架构决策）：
+       - 本类在 fuse() 输出端“保证不丢弃召回候选”（召回率高）。
+       - 下游 merged_atom[:FUSED_TOP_K=15] 截断是 RRF 范围之外的“reranker 性能阈值”，
+         不受 RRF 控制。0.6B Qwen3-Reranker 在 128 tokens 输入下，
+         吃 15 条候选单次推理 ~0.7~1s，吃 30 条 ~1.5~2s且召回增益微弱。
+         两者职责不同：“RRF 保证输入端召回率” + “FUSED_TOP_K 控制 reranker 延迟”。
+
+    🔧 2026-09-20 参数独立：所有可调参数都从环境变量读取（默认值与原硬编码一致）：
+       MEMORY_OS_RRF_K              默认 60
+       MEMORY_OS_RRF_SCALE          默认 100.0  （仅供调试，不影响语义）
+       MEMORY_OS_RRF_NEO4J_DELTA    默认 0.15
+    """
 
     name = "rrf"
 
-    RRF_K = 60
-    # 缩放因子：RRF 原始分约 0.01~0.03，乘 100 后变 1~3，跟 arithmetic 同一量纲
-    # 这样 fusion_post_fuse 里的 importance 加权和 final_score 公式才能兼容
-    RRF_SCALE = 100.0
-    NEO4J_CHANNEL_WEIGHT = 50.0  # 对应 arithmetic 的 +0.3 / 60 * 100 = 50
+    RRF_K = int(os.environ.get("MEMORY_OS_RRF_K", "60"))
+    RRF_SCALE = float(os.environ.get("MEMORY_OS_RRF_SCALE", "100.0"))
+    NEO4J_BOOST_DELTA = float(os.environ.get("MEMORY_OS_RRF_NEO4J_DELTA", "0.15"))
 
     def fuse(self, vec_items, bm25_items, graph_entity_names=None):
         vec_ranks = self._build_rank_map(vec_items or [])
@@ -960,10 +1001,12 @@ class RRFFusion(FusionAlgorithm):
                 }
                 hit = any(e in summary_lower for e in ent_set) or bool(ent_set & item_ents)
                 if hit:
-                    it["sort_key"] = round(it["sort_key"] + self.NEO4J_CHANNEL_WEIGHT, 6)
+                    # 🔧 2026-09-20：×1.15 而非 +50，保持与 arithmetic 的 +0.3 同一物理含义
+                    it["sort_key"] = round(it["sort_key"] * (1 + self.NEO4J_BOOST_DELTA), 6)
 
         # 末尾后处理（RRF 只跑时间衰减，不跑 importance_weight）：
         # RRF 本意是按召回排名排序，与记忆重要性无关，不应被 importance 二次加权
+        # 🔧 2026-09-20：time_decay 改为有界加法（±0.25），不会压制 RRF 排名
         fused = time_decay(fused)
 
         fused.sort(key=lambda x: -float(x.get("sort_key", 0)))

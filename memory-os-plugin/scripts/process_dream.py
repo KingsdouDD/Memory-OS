@@ -1907,9 +1907,37 @@ def write_kos_v5_return_pids(kos):
                 except Exception as e:
                     print(f"[warn] ensure collection {collection}: {e}", file=sys.stderr)
 
-            # L1 不做去重（2026-09-12 确认：只对比 L0）
-            # 直接 CREATE，每条 KO 独立一条 L1
-            # 不写 decision 日志（避免噪声）
+            # 🔧 2026-09-20 修复：L1 也走 LLM dedup。
+            # 原则：召回数条候选 L1 + 新 L1 一次性喂给 LLM，LLM 判定重复 → 跳过整条 KO。
+            # LLM 调用失败则保守 CREATE（避免误杀）。
+            try:
+                new_summary = (ko_inner.get("summary") or "").strip()
+                if new_summary and client is not None:
+                    from dedup_bridge import llm_judge_l1_duplicate
+                    candidates = _ann_find_candidates_in_collection(collection, new_summary, top_k=5) if hasattr(__builtins__, '_ann_find_candidates_in_collection') else []
+                    if not candidates:
+                        # 退而其次：用 _ann_find_candidates
+                        try:
+                            from process_dream import _ann_find_candidates_in_collection
+                            candidates = _ann_find_candidates_in_collection(collection, new_summary, top_k=5)
+                        except Exception:
+                            candidates = []
+                    if candidates:
+                        cand_summaries = [(c.get("summary") or "").strip() for c in candidates]
+                        cand_ids = [str(c.get("pid") or c.get("id") or "") for c in candidates]
+                        is_dup, matched_id, dup_reason = llm_judge_l1_duplicate(new_summary, cand_summaries, cand_ids)
+                        if is_dup is True:
+                            report["skipped"] += 1
+                            _log_decision("L1_DEDUP_SKIP", dup_reason, ko_inner, candidates)
+                            if pid is not None:
+                                result["pids"].append(str(pid))
+                                result["actions"].append((str(pid), "SKIP"))
+                            continue
+                        elif is_dup is False:
+                            _log_decision("L1_DEDUP_CREATE", "LLM 判新 L1 与候选不同", ko_inner, candidates)
+            except Exception as e:
+                print(f"[warn] L1 dedup 调用失败 (fallback CREATE): {e}", file=sys.stderr)
+                # 保守策略：dedup 调用失败 → 继续走原写入流程
 
             # PID 预计算：纯函数，同 KO 同 PID
             try:

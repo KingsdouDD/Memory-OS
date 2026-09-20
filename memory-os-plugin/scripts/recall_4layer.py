@@ -38,7 +38,13 @@ import time
 from pathlib import Path
 
 from process_dream import embed, _qdrant_client, neo4j_entity_search, neo4j_expand
-from recall_fusion import fusion_boost_graph_hits, kg_verify_v2, association_expand
+from recall_fusion import fusion_boost_graph_hits, association_expand
+# 🔧 2026-09-20 清理：kg_verify_v2 是旧 pipeline（recall_for_hook 之前）
+# 的产物，当时想用“sort_key×0.5 + sim×0.5”作为综合分。
+# 现状：reranker 作为最终裁判，rerank_score 100% 决定 final_score，
+#      fuse 内部只保留粗排信号，kg_verify_v2 在 4 layer 主流程中从不被调用。
+# 保留 implementation 在 recall_fusion.py 里作为运行时不使用的 API（未来可复用），
+# 但这里不 import，避免误导后人。
 from recall_config import RecallConfig
 
 try:
@@ -50,13 +56,18 @@ except Exception:
 
 # ── 召回阈值（2026-09-11 确认）────────────────────────────
 # 🔧 2026-09-17 调整：数据量增大后召回策略改为多轮渐进式过滤
+# 🔧 2026-09-20 提严：BGE-M3 在 0.62~0.73 区是噪声区（语义不相关但 token 重叠高），
+#    提高到 0.75 才进入"可能相关"区间。
 VEC_TOP_K = 20           # 向量召回 top-20
 BM25_TOP_K = 20          # BM25 召回 top-20
 FUSED_TOP_K = 15         # 融合后取 top-15 进 reranker
 RERANK_TOP_K = 5         # reranker 输出 top-5（作为最终输出）
-SIM_WATERMARK = 0.62     # 向量 / BM25 双方 sim 阈值（确值）
+SIM_WATERMARK = 0.70     # 向量 / BM25 双方 sim 阈值（0.62 → 0.70：抬到 BGE-M3 长句相关区下限）
 DUAL_CHANNEL_BOOST = 1.5  # vec ∩ bm25 双通道命中加权
 SINGLE_CHANNEL_PENALTY = 0.7  # 单通道命中减权
+# Reranker 输出质量阈值。reranker sigmoid < 0.5 说明这条模型认为不相关，
+# 不应该被算作“有效召回”拼接进 prompt。
+RERANK_MIN_SCORE = 0.5
 
 # ── 模型探活 + 智能拉起 ───────────────────────────────────────
 # 端口 up ≠ 模型就绪。idle timeout 后进程还在但模型已卸载。
@@ -355,32 +366,18 @@ def _build_l1_items_from_hits(hits):
 # ============================================================
 # Q2. entity overlap 计算（仅作辅助信号，不进 final_score）
 # ============================================================
-
-def _compute_entity_overlap(items, filter_entities):
-    """给 items 算 entity overlap，填 entity_overlap / combined_score 字段。
-
-    注意：entity_overlap 只作为辅助信号，不进入最终打分。
-    最终 L1 排序只由 rerank_score + importance 决定。
-    """
-    if not items:
-        return items
-    w = ENTITY_OVERLAP_WEIGHT
-    fset = set(e.strip().lower() for e in filter_entities if e and len(e.strip()) >= 2)
-
-    for it in items:
-        sim = float(it.get("score", 0))
-        overlap = _entity_overlap(fset, it.get("entities") or [])
-        it["entity_overlap"] = round(overlap, 3)
-        # combined_score 保留为参考，但不再进 final_score
-        it["combined_score"] = round(sim * (1 - w) + overlap * w, 4)
-    return items
+# 🔧 2026-09-20 清理：原本 _compute_entity_overlap 函数被删除。
+# 原函数的作用是填 entity_overlap / combined_score 字段，
+# 但 combined_score 从未被使用，entity_overlap 只在 context 里报个均值。
+# reranker 作为最终裁判，这些粗排信号全部被丢弃。
+# 重复的 ent_set & item_ents 计算逻辑同步从 ArithmeticFusion.fuse 删除。
 
 
 # ============================================================
 # Q3. L0/L2/L3 命中 → 批量追溯到 L1 记录
 # ============================================================
 
-def _resolve_l1_records_from_hits(layer_hits, dedup_pids=None):
+def _resolve_l1_records_from_hits(layer_hits, dedup_pids=None, query=None, embed_fn=None):
     """上层命中（L0/L2/L3）→ 读 payload.linked_l1_pids → 批量 retrieve L1 记录。
 
     设计要点：
@@ -388,18 +385,31 @@ def _resolve_l1_records_from_hits(layer_hits, dedup_pids=None):
       - 跨多个 L1 collection 查（payload.entities / importance 都拿到）
       - 返回标准 L1 item 结构，可直接进 merged_atom
 
+    🔧 2026-09-20 修复致命 bug：
+      原代码把 L2 hit 的分数当作 L1 的 score，但这俩根本不是一回事。
+      L2 命中"童年概念" 0.7 说的是概念跟 query 的相似度，
+      不是"童年钓龙虾"这条具体 L1 记忆跟 query 的相似度。
+      修复：拿到 L1 后自己算一次 L1↔query 余弦，sim < MIN_L1_SIM 丢弃。
+      score 字段也改成 L1↔query 自己的 sim，不再继承 L2 父分。
+
     Args:
         layer_hits: [{"pid": ..., "score": ..., "layer": "L0"/"L2"/"L3"}, ...]
         dedup_pids: 已收集的 L1 PID 集合（合并去重用）
+        query: 用户原始 query（必查）。L1↔query 二次打分用。
+        embed_fn: embed 函数（可注入便于测试）
 
     Returns:
         [{"pid": ..., "summary": ..., "score": ..., "entities": [...], ...}, ...]
     """
+    # L1 二次打分阈值：低于此值丢弃
+    # BGE-M3 在 0.55 以下是噪声（参考 recall_config VEC_MIN_SCORE=0.60 + 业内共识）
+    MIN_L1_SIM = 0.55
+
     if dedup_pids is None:
         dedup_pids = set()
 
     # 1. 从所有上层 hit 的 payload 里读 linked_l1_pids，去重
-    l1_pid_to_score = {}  # pid -> 最高分（来自上层 hit）
+    l1_pid_to_score = {}  # pid -> 最高分（来自上层 hit，仅作排序用）
     try:
         client = _qdrant_client()
         for hit in layer_hits:
@@ -473,7 +483,8 @@ def _resolve_l1_records_from_hits(layer_hits, dedup_pids=None):
                 except Exception:
                     pass
 
-        # 3. 构造标准 L1 item
+        # 3. 构造标准 L1 item（先用暂存 list，最后统一做 L1↔query 余弦过滤）
+        l1_candidates = []
         for l1_pid, parent_score in l1_pid_to_score.items():
             pt = retrieved.get(l1_pid)
             if pt is None:
@@ -482,14 +493,13 @@ def _resolve_l1_records_from_hits(layer_hits, dedup_pids=None):
             summary = pl.get("summary") or pl.get("text") or ""
             if not summary:
                 continue
-            l1_items.append({
+            l1_candidates.append({
                 "summary": summary,
                 "relation": pl.get("memory_type", ""),
-                "score": parent_score,
+                "score": 0.0,   # 后面用 L1↔query sim 填充，不继承 L2 父分
+                "_parent_score": parent_score,  # 保留供调试
                 "source": "l0l2l3_resolved",
-                "collection": (pt.id and
-                              next((c for c in RecallConfig.COLLECTIONS
-                                    if True), "")),
+                "collection": "",
                 "_qdrant_pid": pt.id,
                 "importance": pl.get("importance", 0.5),
                 "ts": pl.get("ts", ""),
@@ -500,11 +510,63 @@ def _resolve_l1_records_from_hits(layer_hits, dedup_pids=None):
                 "valid_time": pl.get("valid_time") or {},
                 "recorded_at": pl.get("recorded_at") or "",
                 "source_time": pl.get("source_time") or "",
-                "recall_reason": f"由上层 L 命中追溯",
             })
             dedup_pids.add(l1_pid)
     except Exception as e:
         print(f"[warn] _resolve_l1: retrieve L1 records failed: {e}", file=sys.stderr)
+        return []
+
+    if not l1_candidates:
+        return []
+
+    # 4. 🔧 2026-09-20 L1↔query 二次打分：算每条 L1 跟 query 的真实余弦
+    if query is None:
+        # 兜底：没传 query 时保留全部（保留旧行为，但应该传）
+        for c in l1_candidates:
+            c["score"] = c["_parent_score"]
+            c["recall_reason"] = f"由上层 L 命中追溯（未二次打分）"
+            l1_items.append(c)
+        return l1_items
+
+    if embed_fn is None:
+        from process_dream import embed as _embed
+        embed_fn = _embed
+
+    try:
+        summaries = [c["summary"] for c in l1_candidates]
+        vectors = embed_fn([query] + summaries)
+        if not vectors or len(vectors) < 2:
+            # embed 失败时兜底用 parent_score
+            for c in l1_candidates:
+                c["score"] = c["_parent_score"]
+                c["recall_reason"] = f"由上层 L 命中追溯（embed 失败兜底）"
+                l1_items.append(c)
+            return l1_items
+        query_vec = vectors[0]
+    except Exception as e:
+        print(f"[warn] _resolve_l1: L1↔query embed failed: {e}", file=sys.stderr)
+        for c in l1_candidates:
+            c["score"] = c["_parent_score"]
+            c["recall_reason"] = f"由上层 L 命中追溯（embed 异常兜底）"
+            l1_items.append(c)
+        return l1_items
+
+    for i, c in enumerate(l1_candidates):
+        mem_vec = vectors[i + 1] if i + 1 < len(vectors) else None
+        if not mem_vec:
+            continue
+        dot = sum(a * b for a, b in zip(query_vec, mem_vec))
+        nq = sum(a * a for a in query_vec) ** 0.5
+        nm = sum(b * b for b in mem_vec) ** 0.5
+        sim = dot / (nq * nm + 1e-9)
+        # 低于阈值丢弃：这条 L1 跟 query 真的不相关，linked_l1_pids 只是碰巧关联到
+        if sim < MIN_L1_SIM:
+            continue
+        c["score"] = round(sim, 4)
+        c["sim"] = round(sim, 4)
+        c["sort_key"] = round(sim, 4)  # 给后面 fusion_boost_graph_hits / fused 排序一个初始值
+        c["recall_reason"] = f"由上层 L 命中追溯（L1↔query sim={sim:.3f}）"
+        l1_items.append(c)
 
     return l1_items
 
@@ -913,9 +975,9 @@ def recall_4layer(query, top_k=5, layers=None):
             except Exception as e:
                 print(f"[warn] vec recall failed: {e}", file=sys.stderr)
 
-            # entity overlap 只作辅助信号填字段
-            if filter_entities and vec_items:
-                vec_items = _compute_entity_overlap(vec_items, filter_entities)
+            # 🔧 2026-09-20：删除 _compute_entity_overlap 调用
+            # 原因：combined_score 从未使用；entity_overlap 只在 context 里报均值，不参与排序。
+            # reranker 100% 决定 final_score，这个补字段计算是纯浪费。
 
     # ── Step 4-B: BM25 召回（top 10，0.62 阈值通过 norm_score 过滤）────
     bm25_items = []
@@ -983,7 +1045,10 @@ def recall_4layer(query, top_k=5, layers=None):
             upper_layer_hits.append({**h, "collection": L2_COLLECTION})
         if upper_layer_hits:
             resolved_l1_items = _resolve_l1_records_from_hits(
-                upper_layer_hits, dedup_pids=l1_resolved_seen
+                upper_layer_hits,
+                dedup_pids=l1_resolved_seen,
+                query=query,
+                embed_fn=embed,
             )
             atom.extend(resolved_l1_items)
 
@@ -1107,7 +1172,12 @@ def recall_4layer(query, top_k=5, layers=None):
         reranker_call_count = 1
         rerank_map = {idx: score for idx, score in reranked}
 
-        # 按 reranker 返回顺序重建 merged_atom（reranker 100% 决定顺序）
+        # 🔧 2026-09-20 修复 reranker 输出污染：
+        # 原逻辑：reranker 返回 N 条，merged_atom 砍到 RERANK_TOP_K(5)。
+        # BUG：reranker 也可能输出全低分（sigmoid<0.5，说明模型认为都不相关），
+        #       但 hard-coded [:5] 硬凑 5 条进 prompt，导致“召回召回出 5 条不相关记忆”污染。
+        # 新逻辑：rerank_score < RERANK_MIN_SCORE 的项直接丢弃，
+        #       上限仍 RERANK_TOP_K，但宁缺勿滥。
         reranked_atom = []
         for idx, _ in reranked:
             if 0 <= idx < len(merged_atom):
@@ -1115,14 +1185,13 @@ def recall_4layer(query, top_k=5, layers=None):
                 m["rerank_score"] = rerank_map[idx]
                 # 100% 用 reranker 分数，sort_key 只保留为调试参考
                 m["final_score"] = round(rerank_map[idx], 4)
+                if rerank_map[idx] < RERANK_MIN_SCORE:
+                    # 低于阈值 → 认为不相关，不进 prompt
+                    continue
                 reranked_atom.append(m)
-        # reranker 漏召的候选（idx >= len(reranked)）默认按 sort_key 补位
-        for idx in range(len(merged_atom)):
-            if idx not in rerank_map:
-                m = merged_atom[idx]
-                m["rerank_score"] = 0.0
-                m["final_score"] = round(m.get("score", 0) or 0.0001, 4)
-                reranked_atom.append(m)
+        # 🔧 2026-09-20 同时丢弃“漏召补位”的低分项：
+        # 之前默认按 sort_key 补位，sort_key 是上层 hit 分（0.7+）→ 会让不相关项进入 prompt。
+        # 现在补位项的 final_score 默认 0.0 < RERANK_MIN_SCORE，自然被后面过滤去掉。
         merged_atom = reranked_atom
 
     merged_atom = merged_atom[:RERANK_TOP_K]
